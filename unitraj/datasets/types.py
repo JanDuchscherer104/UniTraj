@@ -1,8 +1,26 @@
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
+import matplotlib.pyplot as plt
 import numpy as np
 from metadrive.scenario.scenario_description import MetaDriveType
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from torch import Tensor, int64
+
+# -----------------------------------------------------------------------------
+# Shape symbol key used throughout docstrings
+#   T – number of timesteps in raw data
+#   P – past trajectory length (past_len)
+#   F – future trajectory length (future_len)
+#   S – total trajectory steps (S = P + F)
+#   N – number of objects / agents in a scenario
+#   A – maximum number of agents kept per sample (max_num_agents)
+#   R – maximum number of road polylines kept (max_roads)
+#   L – number of points per polyline segment (num_points_each_polyline)
+#   C – coordinate dimension (2 = x,y or 3 = x,y,z)
+#   D – generic feature dimension
+#   B – batch size / number of “center” agents drawn from a scenario
+# -----------------------------------------------------------------------------
 
 # Type alias for object ID (usually string)
 ObjectID = str
@@ -13,19 +31,19 @@ class RawStateDict(TypedDict):
     """Represents the state of an object at multiple timesteps."""
 
     position: np.ndarray
-    """[num_timesteps, 3] (x, y, z)"""
+    """[T, 3] (x, y, z)"""
     length: np.ndarray
-    """[num_timesteps, 1]"""
+    """[T, 1]"""
     width: np.ndarray
-    """[num_timesteps, 1]"""
+    """[T, 1]"""
     height: np.ndarray
-    """[num_timesteps, 1]"""
+    """[T, 1]"""
     heading: np.ndarray
-    """[num_timesteps, 1]"""
+    """[T, 1]"""
     velocity: np.ndarray
-    """[num_timesteps, 2] (vx, vy)"""
+    """[T, 2] (vx, vy)"""
     valid: np.ndarray
-    """[num_timesteps, 1] (boolean/int)"""
+    """[T, 1] (bool)"""
     # Potentially other fields like acceleration
 
 
@@ -42,7 +60,7 @@ class RawMapFeatureDict(TypedDict):
     """Represents a single map feature in the raw scenario."""
 
     polyline: np.ndarray
-    """[num_points, 2 or 3] (x, y, [z]) representing the feature geometry."""
+    """[N, C] polyline coordinates for this feature (N = # points)."""
     type: str
     """Map feature type string, e.g., 'LANE', 'ROAD_LINE'."""
 
@@ -62,7 +80,7 @@ class RawScenarioDict(TypedDict):
     scenario_id: str
     """Unique identifier for the scenario."""
     timestamps_seconds: np.ndarray
-    """[num_timesteps,] Timestamps for each step in seconds."""
+    """[T] Timestamps for each step (seconds)."""
     tracks: Dict[ObjectID, RawTrackDict]
     """Dictionary mapping object IDs to their track data."""
     map_features: Dict[str, RawMapFeatureDict]
@@ -91,7 +109,7 @@ class TrackInfosDict(TypedDict):
     object_type: List[int]
     """List of object types (mapped to integers) corresponding to object_id."""
     trajs: np.ndarray
-    """[num_objects, total_steps, 10] Array containing trajectory data (x,y,z,l,w,h,heading,vx,vy,valid)."""
+    """[N, S, 10] Trajectories for all objects (features as listed)."""
 
 
 class MapInfoEntry(TypedDict):
@@ -121,7 +139,7 @@ class MapInfosDict(TypedDict):
     speed_bump: List[MapInfoEntry]
     """List of speed bump features."""
     all_polylines: np.ndarray
-    """[total_points, 7] Array containing all map polyline points (x,y,z, dx,dy,dz, type_int)."""
+    """[L, 7] Stacked polyline points for the entire map."""
 
 
 class DynamicMapInfosDict(TypedDict):
@@ -172,130 +190,185 @@ class InternalFormatDict(TypedDict):
 
 
 # --- Processed Data (Output of process, Input to postprocess/getitem) ---
-
-
 class ProcessedDataDict(TypedDict):
     """Structure holding processed data for multiple agents (batch-like before splitting)."""
 
     scenario_id: np.ndarray
-    """[num_agents_in_scenario,] Scenario ID for each agent instance."""
+    """[B] Scenario ID for each center agent."""
     obj_trajs: np.ndarray
-    """[num_agents_in_scenario, max_num_agents, past_len, num_features] Past trajectories of all objects relative to each agent."""
+    """[B, A, P, D] Past trajectories of all objects relative to each center agent."""
     obj_trajs_mask: np.ndarray
-    """[num_agents_in_scenario, max_num_agents, past_len] Boolean mask for valid past trajectory points."""
+    """[B, A, P] Mask for past trajectories."""
     track_index_to_predict: np.ndarray
-    """[num_agents_in_scenario,] Index of the agent-to-predict within the max_num_agents dimension."""
+    """[B] Index of the center agent within A."""
     obj_trajs_pos: np.ndarray
-    """[num_agents_in_scenario, max_num_agents, past_len, 3] Past positions (x, y, z) of all objects."""
+    """[B, A, P, 3] Past positions (x, y, z)."""
     obj_trajs_last_pos: np.ndarray
-    """[num_agents_in_scenario, max_num_agents, 3] Last valid position (x, y, z) for each object in the past."""
+    """[B, A, 3] Last valid past position for each object."""
     center_objects_world: np.ndarray
-    """[num_agents_in_scenario, 10] World-frame state of the agent-to-predict at the current time step."""
+    """[B, 10] World‑frame state of each center agent at t=0."""
     center_objects_id: np.ndarray
-    """[num_agents_in_scenario,] Object ID of the agent-to-predict."""
+    """[B] Object ID of each center agent."""
     center_objects_type: np.ndarray
-    """[num_agents_in_scenario,] Object type (int) of the agent-to-predict."""
+    """[B] Object type enum of each center agent."""
     map_center: np.ndarray
-    """[num_agents_in_scenario, 1, 3] Map center used for normalization for each agent."""
+    """[B, 1, 3] Map center used for normalization."""
     obj_trajs_future_state: np.ndarray
-    """[num_agents_in_scenario, max_num_agents, future_len, 4] Future states (x, y, vx, vy) of all objects."""
+    """[B, A, F, 4] Future states (x, y, vx, vy)."""
     obj_trajs_future_mask: np.ndarray
-    """[num_agents_in_scenario, max_num_agents, future_len] Boolean mask for valid future trajectory points."""
+    """[B, A, F] Mask for future states."""
     center_gt_trajs: np.ndarray
-    """[num_agents_in_scenario, future_len, 4] Ground truth future trajectory (x, y, vx, vy) for the agent-to-predict."""
+    """[B, F, 4] Ground‑truth future trajectory of center agents."""
     center_gt_trajs_mask: np.ndarray
-    """[num_agents_in_scenario, future_len] Boolean mask for valid ground truth future points."""
+    """[B, F] Mask for ground‑truth future points."""
     center_gt_final_valid_idx: np.ndarray
-    """[num_agents_in_scenario,] Index of the last valid point in the ground truth future trajectory."""
+    """[B] Index of last valid GT point."""
     center_gt_trajs_src: np.ndarray
-    """[num_agents_in_scenario, total_steps, 10] Original world-frame trajectory of the agent-to-predict."""
+    """[B, S, 10] Original world‑frame trajectory of center agents."""
     map_polylines: np.ndarray
-    """[num_agents_in_scenario, max_roads, max_points, map_feat_dim] Map polyline features relative to each agent."""
+    """[B, R, L, 29] Map polyline features relative to each center agent."""
     map_polylines_mask: np.ndarray
-    """[num_agents_in_scenario, max_roads, max_points] Boolean mask for valid map polyline points."""
+    """[B, R, L] Mask for map polylines."""
     map_polylines_center: np.ndarray
-    """[num_agents_in_scenario, max_roads, 3] Center point (x, y, z) for each map polyline."""
+    """[B, R, 3] Center of each polyline segment."""
     dataset_name: List[str]
-    """[num_agents_in_scenario,] Name of the source dataset for each agent."""
+    """[B] Name of the source dataset."""
 
 
-class DatasetItem(TypedDict):
-    """Structure for a single data sample returned by __getitem__."""
+class DatasetItem(BaseModel):
+    """
+    Strongly-typed data model for a single sample.
+    """
 
-    scenario_id: np.bytes_
-    """Scenario unique ID. shape: (), dtype: np.bytes_ (|S36)"""
+    @field_validator("scenario_id", "center_objects_id", "dataset_name", mode="before")
+    @classmethod
+    def _validate_str_fields(cls, v):
+        # Handle numpy scalar/array
+        if isinstance(v, (np.generic, np.ndarray)):
+            try:
+                v = v.item()
+            except Exception:
+                pass
+        # Decode bytes to str
+        if isinstance(v, (bytes, bytearray)):
+            return v.decode("utf-8")
+        # If already str, leave unchanged
+        if isinstance(v, str):
+            return v
+        return v
 
-    obj_trajs: np.ndarray
-    """Past trajectories of surrounding agents. shape: (128, 21, 39), dtype: float32"""
+    scenario_id: str = Field(..., description="Scenario unique ID (|S36)")
 
-    obj_trajs_mask: np.ndarray
-    """Mask for valid past trajectory points. shape: (128, 21), dtype: bool"""
+    obj_trajs: np.ndarray = Field(
+        ..., description="Past trajectories: shape (A, P, 39)"
+    )
+    obj_trajs_mask: np.ndarray = Field(
+        ..., description="Mask for past traj points: shape (A, P)"
+    )
+    track_index_to_predict: np.int64 = Field(
+        ..., description="Index of agent-to-predict in [0,A)"
+    )
 
-    track_index_to_predict: np.int64
-    """Index of the agent-to-predict within the max_num_agents dimension. shape: (), dtype: int64"""
+    obj_trajs_pos: np.ndarray = Field(
+        ..., description="Past positions (x,y,z): shape (A, P, 3)"
+    )
+    obj_trajs_last_pos: np.ndarray = Field(
+        ..., description="Last valid pos per agent: shape (A, 3)"
+    )
 
-    obj_trajs_pos: np.ndarray
-    """Past positions (x, y, z) of surrounding agents. shape: (128, 21, 3), dtype: float32"""
+    center_objects_world: np.ndarray = Field(
+        ..., description="World-frame state of predicted agent: shape (10,)"
+    )
+    center_objects_id: str = Field(..., description="Agent ID (|S4)")
+    center_objects_type: np.int64 = Field(..., description="Agent type enum")
 
-    obj_trajs_last_pos: np.ndarray
-    """Last valid position (x, y, z) for each surrounding agent. shape: (128, 3), dtype: float32"""
+    map_center: np.ndarray = Field(
+        ..., description="Map center for normalization: shape (3,)"
+    )
 
-    center_objects_world: np.ndarray
-    """World-frame state of the agent-to-predict at the current time step. shape: (10,), dtype: float32"""
+    obj_trajs_future_state: np.ndarray = Field(
+        ..., description="Future states (x,y,vx,vy): shape (A, F, 4)"
+    )
+    obj_trajs_future_mask: np.ndarray = Field(
+        ..., description="Mask for future traj points: shape (A, F)"
+    )
 
-    center_objects_id: np.bytes_
-    """Object ID of the agent-to-predict. shape: (), dtype: np.bytes_ (|S4)"""
+    center_gt_trajs: np.ndarray = Field(
+        ..., description="GT future traj (x,y,vx,vy): shape (F, 4)"
+    )
+    center_gt_trajs_mask: np.ndarray = Field(
+        ..., description="Mask for GT future points: shape (F,)"
+    )
+    center_gt_final_valid_idx: float = Field(
+        ..., description="Index of last valid GT point"
+    )
+    center_gt_trajs_src: np.ndarray = Field(
+        ..., description="Original world traj: shape (S, 10)"
+    )
 
-    center_objects_type: np.int64
-    """Object type (int) of the agent-to-predict. shape: (), dtype: int64"""
+    map_polylines: np.ndarray = Field(
+        ..., description="Map polyline feats: shape (R, L, 29)"
+    )
+    map_polylines_mask: np.ndarray = Field(
+        ..., description="Mask for map polyline points: shape (R, L)"
+    )
+    map_polylines_center: np.ndarray = Field(
+        ..., description="Center (x,y,z) per polyline: shape (R, 3)"
+    )
 
-    map_center: np.ndarray
-    """Map center used for normalization. shape: (3,), dtype: float32"""
-
-    obj_trajs_future_state: np.ndarray
-    """Future states (x, y, vx, vy) of surrounding agents. shape: (128, 60, 4), dtype: float32"""
-
-    obj_trajs_future_mask: np.ndarray
-    """Mask for valid future trajectory points. shape: (128, 60), dtype: float32"""
-
-    center_gt_trajs: np.ndarray
-    """Ground truth future trajectory (x, y, vx, vy) for the agent-to-predict. shape: (60, 4), dtype: float32"""
-
-    center_gt_trajs_mask: np.ndarray
-    """Mask for valid ground truth future points. shape: (60,), dtype: float32"""
-
-    center_gt_final_valid_idx: np.float32
-    """Index of the last valid point in the ground truth future trajectory. shape: (), dtype: float32"""
-
-    center_gt_trajs_src: np.ndarray
-    """Original world-frame trajectory of the agent-to-predict. shape: (81, 10), dtype: float32"""
-
-    map_polylines: np.ndarray
-    """Map polyline features. shape: (256, 20, 29), dtype: float32"""
-
-    map_polylines_mask: np.ndarray
-    """Mask for valid map polyline points. shape: (256, 20), dtype: bool"""
-
-    map_polylines_center: np.ndarray
-    """Center point (x, y, z) for each map polyline. shape: (256, 3), dtype: float32"""
-
-    dataset_name: np.bytes_
-    """Name of the source dataset. shape: (), dtype: np.bytes_ (|S38)"""
+    dataset_name: str = Field(..., description="Source dataset name (|S38)")
 
     # Added by postprocess
-    kalman_difficulty: Optional[np.ndarray]
-    """Optional Kalman filter based difficulty score. shape: (3,), dtype: float64"""
+    kalman_difficulty: Optional[np.ndarray] = Field(
+        None, description="Optional Kalman difficulty: shape (K,)"
+    )
+    trajectory_type: Optional[int] = Field(
+        None, description="Optional trajectory type enum"
+    )
 
-    trajectory_type: Optional[np.int64]
-    """Optional classification of the trajectory type. shape: (), dtype: int64"""
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
+
+    def to_tensor_dict(self) -> Dict[str, Any]:
+        """
+        Convert all numpy arrays to torch.Tensors.
+        """
+        import torch
+
+        tdict = {}
+        for name, val in self.__dict__.items():
+            if isinstance(val, np.ndarray):
+                tdict[name] = torch.from_numpy(val)
+            else:
+                tdict[name] = val
+        return tdict
+
+    def summary(self) -> str:
+        """
+        Returns a one-line summary: scenario_id, dataset_name, #agents, #past, #future, #map_polylines.
+        """
+        # decode bytes fields for readability
+        sid = (
+            self.scenario_id.decode("utf-8")
+            if isinstance(self.scenario_id, (bytes, bytearray))
+            else str(self.scenario_id)
+        )
+        ds = (
+            self.dataset_name.decode("utf-8")
+            if isinstance(self.dataset_name, (bytes, bytearray))
+            else str(self.dataset_name)
+        )
+        n_agents, n_past, _ = self.obj_trajs.shape
+        n_future = self.center_gt_trajs.shape[0]
+        # number of static map polylines
+        map_count = self.map_polylines.shape[0]
+        return (
+            f"<DatasetItem {sid!r} @ {ds!r}: "
+            f"agents={n_agents}, past={n_past}, future={n_future}, "
+            f"map_polylines={map_count}>"
+        )
 
 
 # --- Batch Data (Output of collate_fn) ---
-
-# Using Any for Tensor type to avoid torch dependency here
-Tensor = Any
-
-
 class BatchInputDict(TypedDict):
     """Structure of the input_dict within BatchDict (usually tensors)."""
 
@@ -356,87 +429,6 @@ class BatchDict(TypedDict):
     """Often the same as batch_size, represents the number of samples processed."""
 
 
-object_type = {
-    MetaDriveType.UNSET: 0,
-    MetaDriveType.VEHICLE: 1,
-    MetaDriveType.PEDESTRIAN: 2,
-    MetaDriveType.CYCLIST: 3,
-    MetaDriveType.OTHER: 4,
-}
-
-# lane_type = {
-#     0: MetaDriveType.LANE_UNKNOWN,
-#     1: MetaDriveType.LANE_FREEWAY,
-#     2: MetaDriveType.LANE_SURFACE_STREET,
-#     3: MetaDriveType.LANE_BIKE_LANE
-# }
-#
-# road_line_type = {
-#     0: MetaDriveType.LINE_UNKNOWN,
-#     1: MetaDriveType.LINE_BROKEN_SINGLE_WHITE,
-#     2: MetaDriveType.LINE_SOLID_SINGLE_WHITE,
-#     3: MetaDriveType.LINE_SOLID_DOUBLE_WHITE,
-#     4: MetaDriveType.LINE_BROKEN_SINGLE_YELLOW,
-#     5: MetaDriveType.LINE_BROKEN_DOUBLE_YELLOW,
-#     6: MetaDriveType.LINE_SOLID_SINGLE_YELLOW,
-#     7: MetaDriveType.LINE_SOLID_DOUBLE_YELLOW,
-#     8: MetaDriveType.LINE_PASSING_DOUBLE_YELLOW
-# }
-#
-# road_edge_type = {
-#     0: MetaDriveType.LINE_UNKNOWN,
-#     # // Physical road boundary that doesn't have traffic on the other side (e.g.,
-#     # // a curb or the k-rail on the right side of a freeway).
-#     1: MetaDriveType.BOUNDARY_LINE,
-#     # // Physical road boundary that separates the car from other traffic
-#     # // (e.g. a k-rail or an island).
-#     2: MetaDriveType.BOUNDARY_MEDIAN
-# }
-
-polyline_type = {
-    # for lane
-    MetaDriveType.LANE_FREEWAY: 1,
-    MetaDriveType.LANE_SURFACE_STREET: 2,
-    "LANE_SURFACE_UNSTRUCTURE": 2,
-    MetaDriveType.LANE_BIKE_LANE: 3,
-    # for roadline
-    MetaDriveType.LINE_BROKEN_SINGLE_WHITE: 6,
-    MetaDriveType.LINE_SOLID_SINGLE_WHITE: 7,
-    "ROAD_EDGE_SIDEWALK": 7,
-    MetaDriveType.LINE_SOLID_DOUBLE_WHITE: 8,
-    MetaDriveType.LINE_BROKEN_SINGLE_YELLOW: 9,
-    MetaDriveType.LINE_BROKEN_DOUBLE_YELLOW: 10,
-    MetaDriveType.LINE_SOLID_SINGLE_YELLOW: 11,
-    MetaDriveType.LINE_SOLID_DOUBLE_YELLOW: 12,
-    MetaDriveType.LINE_PASSING_DOUBLE_YELLOW: 13,
-    # for roadedge
-    MetaDriveType.BOUNDARY_LINE: 15,
-    MetaDriveType.BOUNDARY_MEDIAN: 16,
-    # for stopsign
-    MetaDriveType.STOP_SIGN: 17,
-    # for crosswalk
-    MetaDriveType.CROSSWALK: 18,
-    # for speed bump
-    MetaDriveType.SPEED_BUMP: 19,
-}
-
-traffic_light_state_to_int = {
-    None: 0,
-    MetaDriveType.LANE_STATE_UNKNOWN: 0,
-    # // States for traffic signals with arrows.
-    MetaDriveType.LANE_STATE_ARROW_STOP: 1,
-    MetaDriveType.LANE_STATE_ARROW_CAUTION: 2,
-    MetaDriveType.LANE_STATE_ARROW_GO: 3,
-    # // Standard round traffic signals.
-    MetaDriveType.LANE_STATE_STOP: 4,
-    MetaDriveType.LANE_STATE_CAUTION: 5,
-    MetaDriveType.LANE_STATE_GO: 6,
-    # // Flashing light signals.
-    MetaDriveType.LANE_STATE_FLASHING_STOP: 7,
-    MetaDriveType.LANE_STATE_FLASHING_CAUTION: 8,
-}
-
-
 class Stage(Enum):
     """
     (TRAIN, VAL, TEST) = ("train", "val", "test")
@@ -455,3 +447,82 @@ class Stage(Enum):
             if value in member.value:
                 return member
         return None
+
+
+traffic_light_state_to_int = {
+    None: 0,
+    MetaDriveType.LANE_STATE_UNKNOWN: 0,
+    # // States for traffic signals with arrows.
+    MetaDriveType.LANE_STATE_ARROW_STOP: 1,
+    MetaDriveType.LANE_STATE_ARROW_CAUTION: 2,
+    MetaDriveType.LANE_STATE_ARROW_GO: 3,
+    # // Standard round traffic signals.
+    MetaDriveType.LANE_STATE_STOP: 4,
+    MetaDriveType.LANE_STATE_CAUTION: 5,
+    MetaDriveType.LANE_STATE_GO: 6,
+    # // Flashing light signals.
+    MetaDriveType.LANE_STATE_FLASHING_STOP: 7,
+    MetaDriveType.LANE_STATE_FLASHING_CAUTION: 8,
+}
+
+
+class ObjectType(Enum):
+    """
+    Mapping from MetaDriveType to integer labels for objects.
+    """
+
+    UNSET = 0
+    VEHICLE = 1
+    PEDESTRIAN = 2
+    CYCLIST = 3
+    OTHER = 4
+
+    @classmethod
+    def from_metadrive_type(cls, md_type: Any) -> "ObjectType":
+        """
+        Convert a MetaDriveType value or string to an ObjectType enum.
+        """
+        # md_type may be a string constant or a MetaDriveType member.
+        name = str(md_type).upper()
+        return cls.__members__.get(name, cls.UNSET)
+
+
+class PolylineType(Enum):
+    """
+    Mapping from MetaDriveType (and some strings) to integer labels for map polylines.
+    """
+
+    UNSET = 0
+
+    LANE_FREEWAY = 1
+    LANE_SURFACE_STREET = 2
+    LANE_BIKE_LANE = 3
+    LINE_BROKEN_SINGLE_WHITE = 6
+    LINE_SOLID_SINGLE_WHITE = 7
+    LINE_SOLID_DOUBLE_WHITE = 8
+    LINE_BROKEN_SINGLE_YELLOW = 9
+    LINE_BROKEN_DOUBLE_YELLOW = 10
+    LINE_SOLID_SINGLE_YELLOW = 11
+    LINE_SOLID_DOUBLE_YELLOW = 12
+    LINE_PASSING_DOUBLE_YELLOW = 13
+
+    BOUNDARY_LINE = 15
+    BOUNDARY_MEDIAN = 16
+    STOP_SIGN = 17
+    CROSSWALK = 18
+    SPEED_BUMP = 19
+
+    @classmethod
+    def from_metadrive_type(cls, md_type: Any) -> "PolylineType":
+        """
+        Convert a MetaDriveType value or string to a PolylineType enum.
+        """
+        # md_type may be a string constant or a MetaDriveType member.
+        name = str(md_type).upper()
+        # Handle known aliases
+        alias = {
+            "LANE_SURFACE_UNSTRUCTURE": "LANE_SURFACE_STREET",
+            "ROAD_EDGE_SIDEWALK": "LINE_SOLID_SINGLE_WHITE",
+        }
+        name = alias.get(name, name)
+        return cls.__members__.get(name, cls.UNSET)

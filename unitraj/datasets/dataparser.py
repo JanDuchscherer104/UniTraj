@@ -1,46 +1,37 @@
-# myproject/parsing/parser.py
-
-import pickle
 from multiprocessing import Pool, cpu_count
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
-import h5py
 import numpy as np
-from metadrive.scenario import utils as sd_utils
-from pydantic import BaseModel, Field
-from tqdm.auto import tqdm
+from pydantic import Field, field_validator
 
 from ..configs.path_config import PathConfig
-from ..datasets import common_utils
 from ..datasets.common_utils import (
+    find_true_segments,
     generate_mask,
     get_polyline_dir,
     interpolate_polyline,
 )
-from ..utils.base_config import CONSOLE
+from ..utils.base_config import BaseConfig, Console
+from . import common_utils
 from .base_dataparser import BaseDataParser
-from .common_utils import is_ddp
 from .types import (
     BatchDict,
     DatasetItem,
     DynamicMapInfosDict,
     InternalFormatDict,
     MapInfosDict,
+    MetaDriveType,
+    ObjectType,
+    PolylineType,
     ProcessedDataDict,
     RawScenarioDict,
     Stage,
     TrackInfosDict,
     TracksToPredictDict,
-    object_type,
-    polyline_type,
 )
 
-object_type = defaultdict(lambda: default_value, object_type)
-polyline_type = defaultdict(lambda: default_value, polyline_type)
 
-
-class DataParserConfig(BaseModel["DataParser"]):
+class DataParserConfig(BaseConfig["DataParser"]):
     """
     Configuration for splitting and preprocessing raw ScenarioNet into cache shards.
     """
@@ -50,24 +41,18 @@ class DataParserConfig(BaseModel["DataParser"]):
     STAGE.TRAIN, STAGE.VAL, STAGE.TEST
     """
 
-    # Where to find raw ScenarioNet folders (can be list for multiple splits)
-    raw_data_dirs: List[Path] = Field(..., description="List of ScenarioNet root dirs")
-
-    # Where to write HDF5/LMDB/Parquet shards
-    cache_root: Path = Field(..., description="Root dir for all cache shards")
-
     # Number of parallel workers (-1 = all CPUs)
     num_workers: int = Field(-1, description="How many processes to spawn")
 
     # When True, ignore any existing cache and rebuild
-    overwrite_cache: bool = Field(True, description="Rebuild cache even if found")
+    rebuild_dataset: bool = Field(False, description="Rebuild cache even if found")
 
-    # If True, only process `debug_samples` per split, single‐threaded
+    # If True, only process `debug_samples` per split, single‐threaded, will rebuild in temp dir
     is_debug: bool = Field(False, description="Debug: only few samples, no MP")
 
     # Data selection
-    num_debug_samples: int = Field(
-        10, description="Max scenarios per split when debug=True"
+    num_debug_samples: Optional[int] = Field(
+        None, description="Max scenarios per split when debug=True"
     )
     starting_frame: List[int] = Field(
         [0],
@@ -75,13 +60,8 @@ class DataParserConfig(BaseModel["DataParser"]):
     )
     max_data_num: List[Optional[int]] = Field(
         [None],
-        description="Maximum number of data for each training dataset, null means all data",
+        description="Maximum number of data for each training dataset, None means all data",
     )
-
-    has_tqdm: bool = True
-    """
-    Whether to use tqdm progress bars for parallel processing.
-    """
 
     # Trajectory configuration
     past_len: int = Field(21, description="History trajectory length, 2.1s")
@@ -94,21 +74,42 @@ class DataParserConfig(BaseModel["DataParser"]):
     masked_attributes: List[str] = Field(
         ["z_axis", "size"], description="Attributes to be masked in the input"
     )
-
-        center_offset_of_map: List[float] = Field(
-        [30.0, 0.0], description="Center offset of the map"
+    allowed_line_types: List[str] = Field(
+        default_factory=lambda: [
+            "lane",
+            "stop_sign",
+            "road_edge",
+            "road_line",
+            "crosswalk",
+            "speed_bump",
+        ],
+        description="Allowed polyline types to be considered in the input",
     )
 
     # Processing configuration
     only_train_on_ego: bool = Field(False, description="Only train on AV")
 
+    # Which object types to include in parsing/filtering
+    object_types: List[ObjectType] = Field(
+        default_factory=lambda: [
+            ObjectType.VEHICLE,
+            ObjectType.PEDESTRIAN,
+            ObjectType.CYCLIST,
+        ],
+        description="Only include these ObjectType enums in filtering tracks",
+    )
+
     # Map processing configuration
-    max_num_agents: int = Field(128, description="Maximum number of agents")
+    center_offset_of_map: List[float] = Field(
+        [30.0, 0.0], description="Center offset of the map"
+    )
+    crop_agents: bool = Field(True)
+    max_num_agents: int = Field(32, description="Maximum number of agents")
     max_num_roads: int = Field(256, description="Maximum number of road segments")
     manually_split_lane: bool = Field(
         False, description="Whether to manually split lane polylines"
     )
-    map_range: float = Field(60.0, description="Range of the map in meters")
+    map_range: float = Field(120.0, description="Range of the map in meters")
     max_points_per_lane: int = Field(
         20, description="Maximum number of points per lane segment"
     )
@@ -140,29 +141,25 @@ class DataParserConfig(BaseModel["DataParser"]):
         return total if self.num_workers < 0 else min(max(1, self.num_workers), total)
 
     def setup_target(self, **kwargs) -> "DataParser":
-        CONSOLE.set_prefix(self.__class__.__name__, "setup_target", self.stage)
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__, "setup_target", str(self.stage)
+        )
 
         if self.is_debug:
             CONSOLE.log(
-                "Debug mode → single worker, no cache (temp dir instead), limited to "
-                f"{self.num_debug_samples} samples"
+                "Debug mode → single worker, limited to "
+                f"{self.num_debug_samples} samples, will use build in temp dir ({self.paths.temp_dir})"
             )
-            self.load_num_workers = 1
-            self.use_cache = False
+            self.num_workers = 1
         else:
             # Use all available CPU cores if load_num_workers is < 0
-            total_cpus = cpu_count()
-            self.load_num_workers = (
-                total_cpus
-                if self.load_num_workers < 0
-                else min(max(self.load_num_workers, 1), total_cpus)
-            )
+            self.num_workers = self.get_num_workers()
             CONSOLE.log(
-                f"Using {self.load_num_workers}/{total_cpus} workers; "
-                f"{'will' if self.use_cache else 'will [bold]not[/bold]'} use cache"
+                f"Using {self.num_workers}/{cpu_count()} workers;\n"
+                f"Rebuild dataset: {self.rebuild_dataset};\n"
             )
 
-        CONSOLE.unset_prefix()
+        # prefix removed automatically on new CONSOLE instances
 
         return self.target(self, **kwargs)
 
@@ -183,577 +180,253 @@ class DataParser(BaseDataParser):
         Returns:
             Optional[InternalFormatDict]: Processed internal format dictionary, or None if invalid.
         """
-        # Ensure metadata exists
-        if "metadata" not in scenario:
-            scenario["metadata"] = {}
-        # Add dataset name if missing in metadata (should be added in process_data_chunk now)
-        if "dataset" not in scenario["metadata"]:
-            scenario["metadata"]["dataset"] = "unknown"  # Or handle differently
-
-        # Ensure required top-level keys exist
-        required_top_keys = ["dynamic_map_states", "tracks", "map_features", "metadata"]
-        if any(key not in scenario for key in required_top_keys):
-            CONSOLE.error(
-                f"Scenario {scenario.get('metadata', {}).get('scenario_id', 'Unknown')} missing required top-level keys."
-            )
-            return None
-
         traffic_lights = scenario["dynamic_map_states"]
         tracks = scenario["tracks"]
         map_feat = scenario["map_features"]
-        metadata = scenario["metadata"]
-
-        # Ensure metadata has required fields
-        required_meta_keys = ["scenario_id", "sdc_id"]
-        if any(key not in metadata for key in required_meta_keys):
-            CONSOLE.error(
-                f"Scenario {metadata.get('scenario_id', 'Unknown')} missing required metadata fields (scenario_id, sdc_id)."
-            )
-            return None
 
         past_length = self.config.past_len
         future_length = self.config.future_len
         total_steps = past_length + future_length
-        starting_fame = self.starting_frame  # Use self.starting_frame set in load_data
+        starting_fame = self.starting_frame
         ending_fame = starting_fame + total_steps
         trajectory_sample_interval = self.config.trajectory_sample_interval
         frequency_mask = generate_mask(
             past_length - 1, total_steps, trajectory_sample_interval
         )
 
-        track_infos = TrackInfosDict(
-            object_id=[],  # {0: unset, 1: vehicle, 2: pedestrian, 3: cyclist, 4: others}
-            object_type=[],
-            trajs=[],
-        )
-
-        # Check if tracks is empty or None
-        if not tracks:
-            CONSOLE.warn(f"Scenario {metadata['scenario_id']} has no tracks.")
-            # Decide if this is an error or just an empty scenario
-            # return None # If empty tracks are invalid
+        track_infos = {
+            "object_id": [],  # {0: unset, 1: vehicle, 2: pedestrian, 3: cyclist, 4: others}
+            "object_type": [],
+            "trajs": [],
+        }  # type: TrackInfosDict
 
         for k, v in tracks.items():
-            # Ensure track value 'v' is a dictionary and has 'state' and 'type'
-            if not isinstance(v, dict) or "state" not in v or "type" not in v:
-                CONSOLE.warn(
-                    f"Invalid track format for ID {k} in scenario {metadata['scenario_id']}. Skipping track."
-                )
-                continue
+
             state = v["state"]
-            # Ensure state is a dictionary
-            if not isinstance(state, dict):
-                CONSOLE.warn(
-                    f"Invalid state format for track ID {k} in scenario {metadata['scenario_id']}. Skipping track."
-                )
-                continue
-
-            # Ensure all state arrays have at least 2 dimensions
             for key, value in state.items():
-                if (
-                    value is not None
-                    and isinstance(value, np.ndarray)
-                    and len(value.shape) == 1
-                ):
+                if len(value.shape) == 1:
                     state[key] = np.expand_dims(value, axis=-1)
-                elif value is None:
-                    CONSOLE.warn(
-                        f"Track {k} has None state for key '{key}' in scenario {metadata['scenario_id']}"
-                    )
-                    # Handle None state, maybe skip track or fill with defaults?
-                    # For now, let downstream code handle potential errors
-
-            # Check if required keys exist and have data
-            required_keys = [
-                "position",
-                "length",
-                "width",
-                "height",
-                "heading",
-                "velocity",
-                "valid",
+            all_state = [
+                state["position"],
+                state["length"],
+                state["width"],
+                state["height"],
+                state["heading"],
+                state["velocity"],
+                state["valid"],
             ]
-            if any(
-                key not in state
-                or state[key] is None
-                or not isinstance(state[key], np.ndarray)
-                or len(state[key]) == 0
-                for key in required_keys
-            ):
-                CONSOLE.warn(
-                    f"Track {k} missing required state data or has invalid format in scenario {metadata['scenario_id']}. Skipping track."
-                )
-                continue  # Skip this track
-
-            # Ensure consistent lengths before concatenation (handle potential ragged arrays)
-            try:
-                # Find the minimum length among required state arrays
-                min_len = min(len(state[key]) for key in required_keys)
-                if min_len == 0:
-                    CONSOLE.warn(
-                        f"Track {k} has zero length for required state data in scenario {metadata['scenario_id']}. Skipping track."
-                    )
-                    continue
-                all_state_list = [state[key][:min_len] for key in required_keys]
-                all_state = np.concatenate(all_state_list, axis=-1)
-            except (ValueError, TypeError) as e:
-                CONSOLE.warn(
-                    f"Error concatenating states for track {k} in scenario {metadata['scenario_id']}: {e}. Skipping track."
-                )
-                continue  # Skip this track
-
-            # Pad if necessary BEFORE slicing
-            current_len = all_state.shape[0]
-            if current_len < ending_fame:
-                pad_width = ((0, ending_fame - current_len), (0, 0))  # Pad at the end
-                # Ensure padding uses valid values (e.g., 0 for state, but maintain validity=0)
-                # A simple pad might be okay if downstream handles validity mask correctly
+            # type, x,y,z,l,w,h,heading,vx,vy,valid
+            all_state = np.concatenate(all_state, axis=-1)
+            assert isinstance(all_state, np.ndarray)
+            # all_state = all_state[::sample_inverval]
+            if all_state.shape[0] < ending_fame:
                 all_state = np.pad(
-                    all_state, pad_width, mode="constant", constant_values=0
+                    all_state, ((ending_fame - all_state.shape[0], 0), (0, 0))
                 )
-                # Explicitly set validity of padded steps to 0
-                all_state[current_len:ending_fame, -1] = 0
-
-            # Slice the required window
             all_state = all_state[starting_fame:ending_fame]
 
-            if all_state.shape[0] != total_steps:
-                CONSOLE.error(
-                    f"Track {k} in scenario {metadata['scenario_id']} has incorrect shape after processing: "
-                    f"{all_state.shape[0]} != {total_steps}. Skipping track."
-                )
-                continue  # Skip this track
+            assert (
+                all_state.shape[0] == total_steps
+            ), f"Error: {all_state.shape[0]} != {total_steps}"
 
             track_infos["object_id"].append(k)
-            track_infos["object_type"].append(object_type[v["type"]])
+            track_infos["object_type"].append(ObjectType.from_metadrive_type(v["type"]))
             track_infos["trajs"].append(all_state)
 
-        # Check if any valid tracks were processed
-        if not track_infos["object_id"]:
-            CONSOLE.warn(
-                f"Scenario {metadata['scenario_id']} has no valid tracks after preprocessing."
-            )
-            return None  # No valid tracks to process
-
-        try:
-            track_infos["trajs"] = np.stack(track_infos["trajs"], axis=0)
-        except ValueError as e:
-            CONSOLE.error(
-                f"Could not stack trajectories for scenario {metadata['scenario_id']}: {e}. Check for inconsistent shapes."
-            )
-            return None
-
-        # Apply frequency mask
+        track_infos["trajs"] = np.stack(track_infos["trajs"], axis=0)
+        # scenario['metadata']['ts'] = scenario['metadata']['ts'][::sample_inverval]
         track_infos["trajs"][..., -1] *= frequency_mask[np.newaxis]
-
-        # Adjust timestamps if they exist
-        if (
-            "ts" in metadata
-            and metadata["ts"] is not None
-            and isinstance(metadata["ts"], (np.ndarray, list))
-            and len(metadata["ts"]) > 0
-        ):
-            ts = np.array(metadata["ts"])  # Ensure numpy array
-            # Pad timestamps similar to trajectory if needed
-            current_ts_len = len(ts)
-            if current_ts_len < ending_fame:
-                ts = np.pad(
-                    ts,
-                    (0, ending_fame - current_ts_len),
-                    mode="constant",
-                    constant_values=np.nan,
-                )  # Pad with NaN or last value
-            metadata["ts"] = ts[starting_fame:ending_fame]
-            # Ensure timestamps have the correct length
-            if len(metadata["ts"]) != total_steps:
-                CONSOLE.warn(
-                    f"Timestamp length mismatch in {metadata['scenario_id']}: {len(metadata['ts'])} != {total_steps}. Using truncated/padded timestamps."
-                )
-                # Ensure it has total_steps length, padding if necessary
-                ts_padded = np.full(total_steps, np.nan)
-                copy_len = min(len(metadata["ts"]), total_steps)
-                ts_padded[:copy_len] = metadata["ts"][:copy_len]
-                metadata["ts"] = ts_padded
-
-        else:
-            CONSOLE.warn(
-                f"Timestamps ('ts') not found, invalid, or empty in metadata for scenario {metadata['scenario_id']}. Cannot add 'timestamps_seconds'."
-            )
-            # Handle missing timestamps - maybe generate dummy ones or raise error?
-            metadata["ts"] = np.full(total_steps, np.nan)  # Fill with NaN
+        scenario["metadata"]["ts"] = scenario["metadata"]["ts"][:total_steps]
 
         # x,y,z,type
-        map_infos = MapInfosDict(
-            lane=[],
-            road_line=[],
-            road_edge=[],
-            stop_sign=[],
-            crosswalk=[],
-            speed_bump=[],
-            lane_id=[],  # This seems misplaced, lane_id is usually per-lane, not global
-            all_polylines=np.zeros((0, 7), dtype=np.float32),  # Initialize empty
-        )
+        map_infos = {
+            "lane": [],
+            "road_line": [],
+            "road_edge": [],
+            "stop_sign": [],
+            "crosswalk": [],
+            "speed_bump": [],
+        }  # type: MapInfosDict
         polylines = []
         point_cnt = 0
-        # Ensure map_feat is a dictionary
-        if not isinstance(map_feat, dict):
-            CONSOLE.warn(
-                f"map_features is not a dictionary in scenario {metadata['scenario_id']}. Skipping map processing."
-            )
-            map_feat = {}  # Process with empty map
-
         for k, v in map_feat.items():
-            # Ensure map feature value 'v' is a dictionary and has 'type'
-            if not isinstance(v, dict) or "type" not in v:
-                CONSOLE.warn(
-                    f"Invalid map feature format for ID {k} in scenario {metadata['scenario_id']}. Skipping feature."
-                )
+            polyline_type_ = PolylineType.from_metadrive_type(v["type"])
+            if polyline_type_ == PolylineType.UNSET:
                 continue
 
-            polyline_type_ = polyline_type[v["type"]]
-            if polyline_type_ == 0:
-                continue
-
-            cur_info = {"id": k, "type": v["type"]}  # Store original type string
-            polyline = None  # Initialize polyline
-
-            try:  # Wrap polyline processing in try-except
-                if polyline_type_ in [1, 2, 3]:  # Lane types
-                    cur_info["speed_limit_mph"] = v.get(
-                        "speed_limit_mph"
-                    )  # Use .get for safety
-                    cur_info["interpolating"] = v.get("interpolating")
-                    cur_info["entry_lanes"] = v.get("entry_lanes")
-                    # Simplified boundary handling (assuming structure is consistent or optional)
-                    cur_info["left_boundary"] = v.get("left_neighbor", [])
-                    cur_info["right_boundary"] = v.get("right_neighbor", [])
-                    polyline = v.get("polyline")
-                    if polyline is not None:
-                        polyline = interpolate_polyline(polyline)
-                    map_infos["lane"].append(cur_info)
-                elif polyline_type_ in [6, 7, 8, 9, 10, 11, 12, 13]:  # Road line types
-                    polyline = v.get(
-                        "polyline", v.get("polygon")
-                    )  # Try polyline then polygon
-                    if polyline is not None:
-                        polyline = interpolate_polyline(polyline)
-                    map_infos["road_line"].append(cur_info)
-                elif polyline_type_ in [15, 16]:  # Road edge types
-                    polyline = v.get("polyline")
-                    if polyline is not None:
-                        polyline = interpolate_polyline(polyline)
-                    cur_info["type_enum"] = (
-                        7  # Override type enum? Check if this is correct.
-                    )
-                    map_infos["road_edge"].append(cur_info)  # Use road_edge key
-                elif polyline_type_ == 17:  # Stop sign
-                    cur_info["lane_ids"] = v.get("lane")
-                    cur_info["position"] = v.get("position")
-                    map_infos["stop_sign"].append(cur_info)
-                    if cur_info["position"] is not None:
-                        polyline = np.array(cur_info["position"])[
-                            np.newaxis
-                        ]  # Ensure it's a 2D array
-                elif polyline_type_ == 18:  # Crosswalk
-                    cur_info["polygon"] = v.get("polygon")
-                    map_infos["crosswalk"].append(cur_info)
-                    polyline = v.get("polygon")
-                elif polyline_type_ == 19:  # Speed bump
-                    cur_info["polygon"] = v.get("polygon")
-                    map_infos["speed_bump"].append(cur_info)
-                    polyline = v.get("polygon")
-                else:
-                    CONSOLE.warn(
-                        f"Unhandled polyline type enum {polyline_type_} for ID {k} in scenario {metadata['scenario_id']}"
-                    )
-                    continue  # Skip unhandled types
-
-                # Process polyline if found
-                if (
-                    polyline is None
-                    or not isinstance(polyline, (np.ndarray, list))
-                    or len(polyline) == 0
-                ):
-                    # CONSOLE.warn(f"Polyline data missing or empty for ID {k}, type {v['type']} in scenario {metadata['scenario_id']}")
-                    cur_polyline = np.zeros(
-                        (0, 7), dtype=np.float32
-                    )  # Use empty array for consistency
-                else:
-                    # Ensure polyline is numpy array
-                    polyline = np.array(polyline, dtype=np.float32)
-                    # Check shape
-                    if len(polyline.shape) != 2 or polyline.shape[1] < 2:
-                        CONSOLE.warn(
-                            f"Invalid polyline shape {polyline.shape} for ID {k}, type {v['type']} in scenario {metadata['scenario_id']}. Skipping."
-                        )
-                        cur_polyline = np.zeros((0, 7), dtype=np.float32)
-                    else:
-                        # Add Z-axis if missing
-                        if polyline.shape[-1] == 2:
-                            polyline = np.pad(
-                                polyline, ((0, 0), (0, 1)), constant_values=0
-                            )  # Pad Z with 0
-                        elif polyline.shape[-1] > 3:
-                            polyline = polyline[
-                                :, :3
-                            ]  # Keep only first 3 columns (x, y, z)
-
-                        # Calculate direction
-                        cur_polyline_dir = get_polyline_dir(polyline)
-                        # Create type array
-                        type_array = np.full(
-                            (polyline.shape[0], 1), polyline_type_, dtype=np.float32
-                        )
-                        # Concatenate: [x, y, z, dir_x, dir_y, dir_z, type_enum]
-                        cur_polyline = np.concatenate(
-                            (polyline, cur_polyline_dir, type_array),
-                            axis=-1,
-                            dtype=np.float32,
-                        )
-
-                polylines.append(cur_polyline)
-                cur_info["polyline_index"] = (point_cnt, point_cnt + len(cur_polyline))
-                point_cnt += len(cur_polyline)
-
-            except Exception as e:
-                CONSOLE.error(
-                    f"Error processing map feature ID {k}, type {v['type']} in scenario {metadata['scenario_id']}: {e}"
+            cur_info = {"id": k}
+            cur_info["type"] = v["type"]
+            if polyline_type_ in [
+                PolylineType.LANE_FREEWAY,
+                PolylineType.LANE_SURFACE_STREET,
+                PolylineType.LANE_BIKE_LANE,
+            ]:
+                cur_info["speed_limit_mph"] = v.get("speed_limit_mph", None)
+                cur_info["interpolating"] = v.get("interpolating", None)
+                cur_info["entry_lanes"] = v.get("entry_lanes", None)
+                try:
+                    cur_info["left_boundary"] = [
+                        {
+                            "start_index": x["self_start_index"],
+                            "end_index": x["self_end_index"],
+                            "feature_id": x["feature_id"],
+                            "boundary_type": "UNKNOWN",  # roadline type
+                        }
+                        for x in v["left_neighbor"]
+                    ]
+                    cur_info["right_boundary"] = [
+                        {
+                            "start_index": x["self_start_index"],
+                            "end_index": x["self_end_index"],
+                            "feature_id": x["feature_id"],
+                            "boundary_type": "UNKNOWN",  # roadline type
+                        }
+                        for x in v["right_neighbor"]
+                    ]
+                except:
+                    cur_info["left_boundary"] = []
+                    cur_info["right_boundary"] = []
+                polyline = v["polyline"]
+                polyline = interpolate_polyline(polyline)
+                map_infos["lane"].append(cur_info)
+            elif polyline_type_ in [
+                PolylineType.LINE_BROKEN_SINGLE_WHITE,  # 6
+                PolylineType.LINE_SOLID_SINGLE_WHITE,  # 7
+                PolylineType.LINE_SOLID_DOUBLE_WHITE,  # 8
+                PolylineType.LINE_BROKEN_SINGLE_YELLOW,  # 9
+                PolylineType.LINE_BROKEN_DOUBLE_YELLOW,  # 10
+                PolylineType.LINE_SOLID_SINGLE_YELLOW,  # 11
+                PolylineType.LINE_SOLID_DOUBLE_YELLOW,  # 12
+                PolylineType.LINE_PASSING_DOUBLE_YELLOW,  # 13
+            ]:
+                try:
+                    polyline = v["polyline"]
+                except:
+                    polyline = v["polygon"]
+                polyline = interpolate_polyline(polyline)
+                map_infos["road_line"].append(cur_info)
+            elif polyline_type_ in [
+                PolylineType.BOUNDARY_LINE,
+                PolylineType.BOUNDARY_MEDIAN,
+            ]:
+                polyline = v["polyline"]
+                polyline = interpolate_polyline(polyline)
+                cur_info["type"] = 7
+                map_infos["road_line"].append(cur_info)
+            elif polyline_type_ == PolylineType.STOP_SIGN:
+                cur_info["lane_ids"] = v["lane"]
+                cur_info["position"] = v["position"]
+                map_infos["stop_sign"].append(cur_info)
+                polyline = v["position"][np.newaxis]
+            elif polyline_type_ == PolylineType.CROSSWALK:
+                map_infos["crosswalk"].append(cur_info)
+                polyline = v["polygon"]
+            elif polyline_type_ == PolylineType.SPEED_BUMP:
+                map_infos["crosswalk"].append(cur_info)
+                polyline = v["polygon"]
+            if polyline.shape[-1] == 2:
+                polyline = np.concatenate(
+                    (polyline, np.zeros((polyline.shape[0], 1))), axis=-1
                 )
-                # Append an empty polyline to maintain consistency if needed, or skip
-                polylines.append(np.zeros((0, 7), dtype=np.float32))
-                cur_info["polyline_index"] = (point_cnt, point_cnt)  # No points added
-
-        # Concatenate all processed polylines
-        if polylines:
             try:
-                map_infos["all_polylines"] = np.concatenate(polylines, axis=0).astype(
-                    np.float32
+                cur_polyline_dir = get_polyline_dir(polyline)
+                type_array = np.zeros([polyline.shape[0], 1])
+                type_array[:] = polyline_type_.value
+                cur_polyline = np.concatenate(
+                    (polyline, cur_polyline_dir, type_array), axis=-1
                 )
-            except ValueError:
-                CONSOLE.warn(
-                    f"Could not concatenate map polylines for scenario {metadata['scenario_id']}. Using empty map."
-                )
-                map_infos["all_polylines"] = np.zeros((0, 7), dtype=np.float32)
-        else:
-            # CONSOLE.warn(f"No valid map polylines found for scenario {metadata['scenario_id']}")
-            map_infos["all_polylines"] = np.zeros((0, 7), dtype=np.float32)
+            except:
+                cur_polyline = np.zeros((0, 7), dtype=np.float32)
+            polylines.append(cur_polyline)
+            cur_info["polyline_index"] = (point_cnt, point_cnt + len(cur_polyline))
+            point_cnt += len(cur_polyline)
 
-        # Process dynamic map states (traffic lights)
-        dynamic_map_infos = DynamicMapInfosDict(
-            lane_id=[], state=[], stop_point=[]
-        )  # Initialize with lists
-        # Ensure traffic_lights is a dictionary
-        if not isinstance(traffic_lights, dict):
-            CONSOLE.warn(
-                f"dynamic_map_states is not a dictionary in scenario {metadata['scenario_id']}. Skipping traffic light processing."
-            )
-            traffic_lights = {}
-
-        for k, v in traffic_lights.items():
-            try:
-                # Ensure traffic light value 'v' is a dictionary
-                if not isinstance(v, dict):
-                    CONSOLE.warn(
-                        f"Invalid traffic light format for ID {k} in scenario {metadata['scenario_id']}. Skipping."
-                    )
-                    continue
-
-                # Ensure 'state' and 'object_state' exist
-                object_states = v.get("state", {}).get("object_state", [])
-                num_states = len(object_states)
-                if num_states == 0:
-                    continue  # Skip if no states observed
-
-                lane_ids = [
-                    str(v.get("lane", "UNKNOWN"))
-                ] * num_states  # Use get with default
-                states = object_states
-                stop_points = v.get(
-                    "stop_point", [0.0, 0.0, 0.0]
-                )  # Use get with default
-
-                # Ensure stop_points is a list of coordinates or a list of lists
-                if not isinstance(stop_points, list) or (
-                    stop_points and not isinstance(stop_points[0], (list, np.ndarray))
-                ):
-                    stop_points = [
-                        list(stop_points)
-                    ] * num_states  # Repeat the single stop point
-                elif stop_points and isinstance(stop_points[0], np.ndarray):
-                    stop_points = [
-                        sp.tolist() for sp in stop_points
-                    ]  # Convert numpy arrays to lists
-
-                # Pad/truncate to total_steps
-                current_len = len(states)
-                if current_len < total_steps:
-                    pad_len = total_steps - current_len
-                    # Choose appropriate padding values (e.g., last known state, UNKNOWN state)
-                    lane_ids.extend(
-                        [lane_ids[-1]] * pad_len if lane_ids else ["UNKNOWN"] * pad_len
-                    )
-                    states.extend(
-                        [states[-1]] * pad_len if states else ["UNKNOWN"] * pad_len
-                    )  # Pad with last state or UNKNOWN
-                    stop_points.extend(
-                        [stop_points[-1]] * pad_len
-                        if stop_points
-                        else [[0.0, 0.0, 0.0]] * pad_len
-                    )
-                elif current_len > total_steps:
-                    lane_ids = lane_ids[:total_steps]
-                    states = states[:total_steps]
-                    stop_points = stop_points[:total_steps]
-
-                dynamic_map_infos["lane_id"].append(
-                    np.array(lane_ids)
-                )  # Store as 1D array per light
-                dynamic_map_infos["state"].append(np.array(states))
-                dynamic_map_infos["stop_point"].append(
-                    np.array(stop_points)
-                )  # Should be (total_steps, 3) or similar
-
-            except Exception as e:
-                CONSOLE.error(
-                    f"Error processing dynamic map state for ID {k} in scenario {metadata['scenario_id']}: {e}"
-                )
-                continue  # Skip this traffic light
-
-        # Construct the final InternalFormatDict
-        ret = InternalFormatDict(
-            track_infos=track_infos,
-            dynamic_map_infos=dynamic_map_infos,
-            map_infos=map_infos,
-            # Add other metadata fields explicitly if they are part of InternalFormatDict
-            scenario_id=metadata["scenario_id"],
-            timestamps_seconds=metadata.get(
-                "ts", np.full(total_steps, np.nan)
-            ),  # Use get with default
-            sdc_id=metadata["sdc_id"],
-            # Add other optional fields from metadata using .get
-            source_id=metadata.get("source_id"),
-            version=metadata.get("version"),
-            objects_of_interest=metadata.get("objects_of_interest"),
-            tracks_to_predict=metadata.get(
-                "tracks_to_predict"
-            ),  # Keep original if present
-            dataset=metadata.get("dataset"),
-            map_center=metadata.get("map_center", np.zeros(3))[
-                np.newaxis
-            ],  # Add default
-            # Calculated fields
-            current_time_index=self.config.past_len - 1,
-            track_length=total_steps,
-            sdc_track_index=-1,  # Initialize SDC index
-        )
-
-        # Find SDC track index safely
         try:
-            ret["sdc_track_index"] = track_infos["object_id"].index(ret["sdc_id"])
-        except (ValueError, IndexError):
-            CONSOLE.error(
-                f"SDC ID {ret['sdc_id']} not found in processed tracks for scenario {ret['scenario_id']}. Setting sdc_track_index to -1."
-            )
-            # Decide how to handle this: return None, or proceed with index -1?
-            # return None # If SDC must be present
+            polylines = np.concatenate(polylines, axis=0).astype(np.float32)
+        except:
+            polylines = np.zeros((0, 7), dtype=np.float32)
+        map_infos["all_polylines"] = polylines
 
-        # Determine tracks_to_predict
-        tracks_to_predict_output = TracksToPredictDict(
-            track_index=[], object_type=[], difficulty=[]
-        )  # Initialize empty
+        dynamic_map_infos = {
+            "lane_id": [],
+            "state": [],
+            "stop_point": [],
+        }  # type: DynamicMapInfosDict
+        for k, v in traffic_lights.items():  # (num_timestamp)
+            lane_id, state, stop_point = [], [], []
+            for cur_signal in v["state"]["object_state"]:  # (num_observed_signals)
+                lane_id.append(str(v["lane"]))
+                state.append(cur_signal)
+                if type(v["stop_point"]) == list:
+                    stop_point.append(v["stop_point"])
+                else:
+                    stop_point.append(v["stop_point"].tolist())
+            # lane_id = lane_id[::sample_inverval]
+            # state = state[::sample_inverval]
+            # stop_point = stop_point[::sample_inverval]
+            lane_id = lane_id[:total_steps]
+            state = state[:total_steps]
+            stop_point = stop_point[:total_steps]
+            dynamic_map_infos["lane_id"].append(np.array([lane_id]))
+            dynamic_map_infos["state"].append(np.array([state]))
+            dynamic_map_infos["stop_point"].append(np.array([stop_point]))
+
+        ret = {
+            "track_infos": track_infos,
+            "dynamic_map_infos": dynamic_map_infos,
+            "map_infos": map_infos,
+        }
+        ret.update(scenario["metadata"])
+        ret["timestamps_seconds"] = ret.pop("ts")
+        ret["current_time_index"] = self.config.past_len - 1
+        ret["sdc_track_index"] = track_infos["object_id"].index(ret["sdc_id"])
 
         if self.config.only_train_on_ego:
-            if ret["sdc_track_index"] != -1:
-                tracks_to_predict_output["track_index"].append(ret["sdc_track_index"])
-                # Assuming SDC is always VEHICLE, get type dynamically if possible
-                sdc_obj_type_enum = track_infos["object_type"][ret["sdc_track_index"]]
-                tracks_to_predict_output["object_type"].append(sdc_obj_type_enum)
-                tracks_to_predict_output["difficulty"].append(
-                    0
-                )  # Default difficulty for SDC
-            else:
-                CONSOLE.warn(
-                    f"only_train_on_ego is True, but SDC track index is invalid for scenario {ret['scenario_id']}"
-                )
+            tracks_to_predict = {
+                "track_index": [ret["sdc_track_index"]],
+                "difficulty": [0],
+                "object_type": [MetaDriveType.VEHICLE],
+            }
+        elif ret.get("tracks_to_predict", None) is None:
+            filtered_tracks = self.trajectory_filter(ret)
+            sample_list = list(filtered_tracks.keys())
+            tracks_to_predict = {
+                "track_index": [
+                    track_infos["object_id"].index(id)
+                    for id in sample_list
+                    if id in track_infos["object_id"]
+                ],
+                "object_type": [
+                    track_infos["object_type"][track_infos["object_id"].index(id)]
+                    for id in sample_list
+                    if id in track_infos["object_id"]
+                ],
+            }
         else:
-            candidate_ids = []
-            source_of_candidates = "metadata"  # Track where the candidates came from
+            sample_list = list(
+                ret["tracks_to_predict"].keys()
+            )  # + ret.get('objects_of_interest', [])
+            sample_list = list(set(sample_list))
+            tracks_to_predict = {
+                "track_index": [
+                    track_infos["object_id"].index(id)
+                    for id in sample_list
+                    if id in track_infos["object_id"]
+                ],
+                "object_type": [
+                    track_infos["object_type"][track_infos["object_id"].index(id)]
+                    for id in sample_list
+                    if id in track_infos["object_id"]
+                ],
+            }
 
-            # Prefer tracks_to_predict from metadata if available and valid format
-            metadata_ttp = ret.get("tracks_to_predict")
-            if (
-                isinstance(metadata_ttp, dict) and "track_index" in metadata_ttp
-            ):  # Check if it's the processed dict format
-                # If it's already processed, use it directly (shouldn't happen here, but defensive)
-                tracks_to_predict_output = metadata_ttp
-                candidate_ids = None  # Mark that we don't need to process candidates
-            elif isinstance(
-                metadata_ttp, dict
-            ):  # Original format {obj_id: {difficulty: x}}
-                candidate_ids = list(metadata_ttp.keys())
-            # Fallback to objects_of_interest if metadata tracks_to_predict is missing/invalid
-            elif ret.get("objects_of_interest") is not None and isinstance(
-                ret["objects_of_interest"], list
-            ):
-                candidate_ids = ret["objects_of_interest"]
-                source_of_candidates = "objects_of_interest"
-            # Fallback to filtering all tracks if neither is available
-            else:
-                # Consider all tracks initially
-                candidate_ids = track_infos["object_id"]
-                source_of_candidates = "all_tracks"
+        ret["tracks_to_predict"] = tracks_to_predict
 
-            # Filter candidates if needed
-            if candidate_ids is not None:
-                valid_indices = []
-                valid_types = []
-                valid_difficulties = []
-                selected_type_enums = [object_type[x] for x in self.config.object_type]
+        ret["map_center"] = scenario["metadata"].get("map_center", np.zeros(3))[
+            np.newaxis
+        ]
 
-                for obj_id in candidate_ids:
-                    try:
-                        idx = track_infos["object_id"].index(obj_id)
-                        obj_type_enum = track_infos["object_type"][idx]
-                        # Check if object type is in the configured list
-                        if obj_type_enum in selected_type_enums:
-                            # Check validity at current time index
-                            if (
-                                track_infos["trajs"][idx, ret["current_time_index"], -1]
-                                > 0
-                            ):
-                                valid_indices.append(idx)
-                                valid_types.append(obj_type_enum)
-                                # Get difficulty if available from original metadata_ttp
-                                difficulty = 0  # Default
-                                if (
-                                    isinstance(metadata_ttp, dict)
-                                    and obj_id in metadata_ttp
-                                    and isinstance(metadata_ttp[obj_id], dict)
-                                ):
-                                    difficulty = metadata_ttp[obj_id].get(
-                                        "difficulty", 0
-                                    )
-                                valid_difficulties.append(difficulty)
-                            # else: CONSOLE.warn(f"Candidate {obj_id} from {source_of_candidates} is not valid at current time.")
-                        # else: CONSOLE.warn(f"Candidate {obj_id} from {source_of_candidates} has type {obj_type_enum}, which is not in selected types.")
-                    except ValueError:
-                        # CONSOLE.warn(f"Candidate object ID {obj_id} from {source_of_candidates} not found in processed tracks.")
-                        pass  # Ignore IDs not found
-
-                tracks_to_predict_output["track_index"] = valid_indices
-                tracks_to_predict_output["object_type"] = valid_types
-                tracks_to_predict_output["difficulty"] = valid_difficulties
-
-        # Final check if any tracks are selected for prediction
-        if not tracks_to_predict_output["track_index"]:
-            CONSOLE.warn(
-                f"No valid tracks selected for prediction in scenario {ret['scenario_id']}"
-            )
-            # Decide if this is critical
-            # return None # If prediction targets are required
-
-        ret["tracks_to_predict"] = tracks_to_predict_output  # Assign the processed dict
-
+        ret["track_length"] = total_steps
         return ret
 
     def process(
@@ -766,26 +439,27 @@ class DataParser(BaseDataParser):
             internal_format (InternalFormatDict): Data in internal format.
 
         Returns:
-            Optional[List[DatasetItem]]: List of processed data items, one per interested agent.
+            Optional[List[DatasetItem]]: List of processed data items, one per agent of interest.
         """
         # Debug: overview of incoming data
-        CONSOLE.dbg(f"process() for scenario {internal_format['scenario_id']} got")
-        CONSOLE.plog(
-            {
-                "len(num_tracks)": len(internal_format["track_infos"]["object_id"]),
-                "traj_shape": (
-                    internal_format["track_infos"]["trajs"].shape
-                    if "trajs" in internal_format["track_infos"]
-                    else None
-                ),
-                "map_polylines_shape": internal_format["map_infos"][
-                    "all_polylines"
-                ].shape,
-                "dynamic_map_count": len(
-                    internal_format["dynamic_map_infos"]["lane_id"]
-                ),
-            }
-        )
+        if self.config.is_debug:
+            CONSOLE = Console.with_prefix(
+                self.__class__.__name__, "process", internal_format["scenario_id"]
+            )
+            CONSOLE.dbg(f"process() for scenario {internal_format['scenario_id']} got")
+            CONSOLE.plog(
+                {
+                    "len(num_tracks)": len(internal_format["track_infos"]["object_id"]),
+                    "traj_shape": (
+                        internal_format["track_infos"]["trajs"].shape
+                        if "trajs" in internal_format["track_infos"]
+                        else None
+                    ),
+                    "map_polylines_shape": internal_format["map_infos"][
+                        "all_polylines"
+                    ].shape,
+                }
+            )
         info = internal_format
         scene_id = info["scenario_id"]
 
@@ -875,9 +549,9 @@ class DataParser(BaseDataParser):
             "center_objects_id": np.array(track_infos["object_id"])[
                 track_index_to_predict
             ],
-            "center_objects_type": np.array(track_infos["object_type"])[
-                track_index_to_predict
-            ],
+            "center_objects_type": np.array(
+                list(map(lambda x: x.value, track_infos["object_type"])), dtype=np.int64
+            )[track_index_to_predict],
             "map_center": info["map_center"],
             "obj_trajs_future_state": obj_trajs_future_state,
             "obj_trajs_future_mask": obj_trajs_future_mask,
@@ -891,18 +565,17 @@ class DataParser(BaseDataParser):
             info["map_infos"]["all_polylines"] = np.zeros((2, 7), dtype=np.float32)
             CONSOLE.log(f"Empty HDMap (zero polylines) for {scene_id}")
 
+        # Get map polylines: support functions that return 2 or 3 elements
         if self.config.manually_split_lane:
-            map_polylines_data, map_polylines_mask, map_polylines_center = (
-                self.get_manually_split_map_data(
-                    center_objects=center_objects, map_infos=info["map_infos"]
-                )
+            result = self.get_manually_split_map_data(
+                center_objects=center_objects, map_infos=info["map_infos"]
             )
         else:
-            map_polylines_data, map_polylines_mask, map_polylines_center = (
-                self.get_map_data(
-                    center_objects=center_objects, map_infos=info["map_infos"]
-                )
+            result = self.get_map_data(
+                center_objects=center_objects, map_infos=info["map_infos"]
             )
+        # Unpack result, allowing 2- or 3-tuple returns
+        map_polylines_data, map_polylines_mask, map_polylines_center = result
 
         ret_dict["map_polylines"] = map_polylines_data
         ret_dict["map_polylines_mask"] = map_polylines_mask.astype(bool)
@@ -974,7 +647,7 @@ class DataParser(BaseDataParser):
 
         return ret_list
 
-    def postprocess(self, output: List[DatasetItem]) -> Optional[List[DatasetItem]]:
+    def postprocess(self, output: List[DatasetItem]) -> List[DatasetItem]:
         """
         Perform post-processing steps like calculating difficulty and trajectory type.
 
@@ -984,77 +657,83 @@ class DataParser(BaseDataParser):
         Returns:
             Optional[List[DatasetItem]]: List of data items with added post-processing info, or None if input is invalid.
         """
-        if not output:  # Handle empty list case
-            CONSOLE.warn("postprocess received an empty list.")
-            return None
-
-        # Process each DatasetItem
-        for item in output:
-            # Calculate Kalman difficulty
-            try:
-                # Check if we have the necessary data for Kalman difficulty calculation
-                future_traj = item.center_gt_trajs
-                future_mask = item.center_gt_trajs_mask
-
-                # Calculate difficulty if we have valid data
-                if (
-                    future_traj is not None
-                    and future_mask is not None
-                    and np.any(future_mask)
-                ):
-                    # Get only the valid future trajectory points
-                    valid_indices = np.where(future_mask)[0]
-                    if len(valid_indices) >= 2:  # Need at least 2 points
-                        valid_traj = future_traj[valid_indices]
-                        difficulty = common_utils.get_kalman_difficulty_single(
-                            valid_traj
-                        )
-                        item.kalman_difficulty = np.array(
-                            [difficulty], dtype=np.float32
-                        )
-                    else:
-                        item.kalman_difficulty = np.array([0.0], dtype=np.float32)
-                else:
-                    item.kalman_difficulty = np.array([0.0], dtype=np.float32)
-            except Exception as e:
-                CONSOLE.warn(f"Error calculating Kalman difficulty: {e}")
-                item.kalman_difficulty = np.array([0.0], dtype=np.float32)
-
-            # Determine trajectory type
-            try:
-                # Check if we have the necessary data for trajectory type calculation
-                future_traj = item.center_gt_trajs
-                future_mask = item.center_gt_trajs_mask
-
-                if (
-                    future_traj is not None
-                    and future_mask is not None
-                    and np.any(future_mask)
-                ):
-                    # Find segments of valid points
-                    segments = common_utils.find_true_segments(future_mask)
-                    if segments:
-                        longest_segment = max(segments, key=lambda s: s[1] - s[0])
-                        if (
-                            longest_segment[1] - longest_segment[0] >= 3
-                        ):  # Need at least 3 consecutive points
-                            start_idx, end_idx = longest_segment
-                            traj_segment = future_traj[start_idx:end_idx]
-                            traj_type = common_utils.get_trajectory_type_single(
-                                traj_segment
-                            )
-                            item.trajectory_type = traj_type
-                        else:
-                            item.trajectory_type = 0  # Stationary type as default
-                    else:
-                        item.trajectory_type = 0  # Stationary type as default
-                else:
-                    item.trajectory_type = 0  # Stationary type as default
-            except Exception as e:
-                CONSOLE.warn(f"Error determining trajectory type: {e}")
-                item.trajectory_type = 0  # Stationary type as default
+        CONSOLE = Console.with_prefix(self.__class__.__name__, "postprocess")
+        common_utils.get_kalman_difficulty(output)
+        common_utils.get_trajectory_type(output)
 
         return output
+
+    def trajectory_filter(self, data: InternalFormatDict) -> Dict[str, Any]:
+        """
+        Filter trajectories to select valid tracks for prediction.
+
+        Args:
+            data (InternalFormatDict): Internal format scenario data.
+
+        Returns:
+            Dict[str, Any]: Dictionary of tracks to predict {object_id: info}.
+        """
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__, "trajectory_filter", self.config.stage.name
+        )
+
+        tracks_to_predict_filtered = {}
+        try:
+            trajs = data["track_infos"]["trajs"]  # (num_obj, steps, feat)
+            obj_ids = data["track_infos"]["object_id"]
+            obj_types_enum = data["track_infos"]["object_type"]
+            current_idx = data["current_time_index"]
+            # object_summary might not exist, calculate necessary info directly
+            # obj_summary = data["object_summary"]
+
+            selected_type_values = [ot.value for ot in self.config.object_types]
+
+            for i, obj_id in enumerate(obj_ids):
+                obj_type_enum = obj_types_enum[i]
+                if obj_type_enum not in selected_type_values:
+                    continue
+
+                positions = trajs[i, :, 0:2]
+                validity = trajs[i, :, -1]
+                track_length = len(validity)
+                valid_steps = validity > 0
+
+                # Check validity at current time
+                if not valid_steps[current_idx]:
+                    continue
+
+                # Check valid ratio
+                valid_ratio = np.sum(valid_steps) / track_length
+                if valid_ratio < 0.5:  # Configurable threshold?
+                    continue
+
+                # Check moving distance for vehicles
+                if obj_type_enum == ObjectType.VEHICLE.value:
+                    valid_positions = positions[valid_steps]
+                    if len(valid_positions) > 1:
+                        moving_distance = np.sum(
+                            np.linalg.norm(np.diff(valid_positions, axis=0), axis=1)
+                        )  # type: float
+                    else:
+                        moving_distance = 0
+                    if moving_distance < 2.0:  # Configurable threshold?
+                        continue
+
+                # If all checks pass, add to prediction list
+                tracks_to_predict_filtered[obj_id] = {
+                    "type_enum": obj_type_enum,
+                    # Add other relevant info if needed
+                }
+        except KeyError as e:
+            CONSOLE.error(
+                f"Missing key in trajectory_filter for scenario {data.get('scenario_id', 'Unknown')}: {e}"
+            )
+        except Exception as e:
+            CONSOLE.error(
+                f"Error in trajectory_filter for scenario {data.get('scenario_id', 'Unknown')}: {e}"
+            )
+
+        return tracks_to_predict_filtered
 
     def get_agent_data(
         self,
@@ -1207,6 +886,19 @@ class DataParser(BaseDataParser):
         max_num_agents = self.config.max_num_agents
         object_dist_to_center = np.linalg.norm(obj_trajs_data[:, :, -1, 0:2], axis=-1)
 
+        if self.config.crop_agents:
+            map_range = self.config.map_range  # reuse the same hyper-param
+            # same forward offset that map pruning uses
+            offset_xy = np.array(self.config.center_offset_of_map, dtype=np.float32)
+            offset_rot = common_utils.rotate_points_along_z(
+                offset_xy[None, :], center_objects[:, 6]
+            )
+            ego_box_center = center_objects[:, :2] + offset_rot
+            # mask agents whose LAST point is outside ROI
+            out_of_box = (
+                np.abs(obj_trajs_data[:, :, -1, 0] - offset_xy[0]) > map_range
+            ) | (np.abs(obj_trajs_data[:, :, -1, 1] - offset_xy[1]) > map_range)
+
         object_dist_to_center[obj_trajs_mask[..., -1] == 0] = 1e10
         topk_idxs = np.argsort(object_dist_to_center, axis=-1)[:, :max_num_agents]
 
@@ -1288,6 +980,10 @@ class DataParser(BaseDataParser):
                 - map_polylines_mask (num_center_objects, num_topk_polylines, num_points_each_polyline): Boolean mask.
                 - map_polylines_center (num_center_objects, num_topk_polylines, 3): Center of each polyline segment.
         """
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__, "get_manually_split_map_data"
+        )
+
         num_center_objects = center_objects.shape[0]
         all_polylines_orig = map_infos[
             "all_polylines"
@@ -1523,6 +1219,8 @@ class DataParser(BaseDataParser):
                 - map_polylines_mask (num_center_objects, num_topk_polylines, max_points_per_lane): Boolean mask.
                 - map_polylines_center (num_center_objects, num_topk_polylines, 3): Center of each polyline.
         """
+        CONSOLE = Console.with_prefix(self.__class__.__name__, "get_map_data")
+
         num_center_objects = center_objects.shape[0]
 
         def transform_to_center_coordinates(neighboring_polylines):
@@ -1546,7 +1244,7 @@ class DataParser(BaseDataParser):
 
         all_polylines = map_infos["polyline_transformed"]
         max_points_per_lane = self.config.max_points_per_lane
-        line_type = self.config.line_type
+
         map_range = self.config.map_range
         center_offset = self.config.center_offset_of_map
         num_agents = all_polylines.shape[0]
@@ -1554,7 +1252,7 @@ class DataParser(BaseDataParser):
         polyline_mask_list = []
 
         for k, v in map_infos.items():
-            if k == "all_polylines" or k not in line_type:
+            if k == "all_polylines" or k not in self.config.allowed_line_types:
                 continue
             if len(v) == 0:
                 continue
@@ -1604,10 +1302,16 @@ class DataParser(BaseDataParser):
 
                 polyline_list.append(segment_list)
                 polyline_mask_list.append(segment_mask_list)
+
         if len(polyline_list) == 0:
-            return np.zeros((num_agents, 0, max_points_per_lane, 7)), np.zeros(
-                (num_agents, 0, max_points_per_lane)
+            CONSOLE.warn("No valid polylines found. Returning empty data.")
+            empty_polys = np.zeros(
+                (num_agents, 0, max_points_per_lane, 7), dtype=np.float32
             )
+            empty_mask = np.zeros((num_agents, 0, max_points_per_lane), dtype=np.int32)
+            empty_center = np.zeros((num_agents, 0, 3), dtype=np.float32)
+            return empty_polys, empty_mask, empty_center
+
         batch_polylines = np.concatenate(polyline_list, axis=1)
         batch_polylines_mask = np.concatenate(polyline_mask_list, axis=1)
 
@@ -1692,10 +1396,11 @@ class DataParser(BaseDataParser):
         Returns:
             Tuple[Optional[np.ndarray], Optional[np.ndarray]]: (center_objects, selected_indices) or (None, None)
         """
+        CONSOLE = Console.with_prefix(self.__class__.__name__, "get_interested_agents")
+
         center_objects_list = []
         track_index_to_predict_selected = []
-        selected_type = self.config.object_type
-        selected_type = [object_type[x] for x in selected_type]
+        # filter by configured object_types
         for k in range(len(track_index_to_predict)):
             obj_idx = track_index_to_predict[k]
 
@@ -1704,7 +1409,7 @@ class DataParser(BaseDataParser):
                     f"obj_idx={obj_idx} is not valid at time step {current_time_index}, scene_id={scene_id}"
                 )
                 continue
-            if obj_types[obj_idx] not in selected_type:
+            if obj_types[obj_idx] not in self.config.object_types:
                 continue
 
             center_objects_list.append(obj_trajs_full[obj_idx, current_time_index])
@@ -1713,7 +1418,7 @@ class DataParser(BaseDataParser):
             CONSOLE.warn(
                 f"No center objects at time step {current_time_index}, scene_id={scene_id}"
             )
-            return None, []
+            return None, None
         center_objects = np.stack(
             center_objects_list, axis=0
         )  # (num_center_objects, num_attrs)
