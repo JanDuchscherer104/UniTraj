@@ -24,11 +24,11 @@ def check_loaded_data(data: DatasetItem, index: int = 0) -> plt.Figure:
     Visualizes agent trajectories and map data for a single sample.
 
     Args:
-        data (DatasetItem): Dictionary containing the data to visualize.
-            - 'obj_trajs' (np.ndarray): Past trajectories.
-            - 'obj_trajs_future_state' (np.ndarray): Future trajectories.
-            - 'map_polylines' (np.ndarray): Map polylines.
-            - 'track_index_to_predict' (np.ndarray): Indices of agents to predict.
+        data (DatasetItem): Object containing the data to visualize with attributes:
+            - obj_trajs (np.ndarray): Past trajectories.
+            - obj_trajs_future_state (np.ndarray): Future trajectories.
+            - map_polylines (np.ndarray): Map polylines.
+            - track_index_to_predict (np.ndarray or int): Indices of agents to predict.
         index (int, optional): Index of the agent to center the visualization on. Defaults to 0.
 
     Returns:
@@ -36,17 +36,17 @@ def check_loaded_data(data: DatasetItem, index: int = 0) -> plt.Figure:
     """
     fig, ax = plt.subplots()
     agents = np.concatenate(
-        [data["obj_trajs"][..., :2], data["obj_trajs_future_state"][..., :2]], axis=-2
+        [data.obj_trajs[..., :2], data.obj_trajs_future_state[..., :2]], axis=-2
     )
-    map = data["map_polylines"]
+    map_polylines = data.map_polylines
 
     if len(agents.shape) == 4:
         agents = agents[index]
-        map = map[index]
-        ego_index = data["track_index_to_predict"][index]
+        map_polylines = map_polylines[index]
+        ego_index = data.track_index_to_predict[index]
         ego_agent = agents[ego_index]
     else:
-        ego_index = data["track_index_to_predict"]
+        ego_index = data.track_index_to_predict
         ego_agent = agents[ego_index]
 
     def draw_line_with_mask(point1, point2, color, line_width=4):
@@ -66,7 +66,7 @@ def check_loaded_data(data: DatasetItem, index: int = 0) -> plt.Figure:
         return (1 - t / total_t, 0, t / total_t)
 
     # Plot the map with mask check
-    for lane in map:
+    for lane in map_polylines:
         for i in range(len(lane) - 1):
             draw_line_with_mask(lane[i, :2], lane[i, 6:8], color="grey", line_width=1)
 

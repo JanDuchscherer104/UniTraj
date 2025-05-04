@@ -5,75 +5,72 @@ import numpy as np
 from pydantic import Field, field_validator
 
 from ..configs.path_config import PathConfig
-from ..datasets.common_utils import (
-    find_true_segments,
-    generate_mask,
-    get_polyline_dir,
-    interpolate_polyline,
-)
+from ..datasets.common_utils import (find_true_segments, generate_mask,
+                                     get_polyline_dir, interpolate_polyline)
 from ..utils.base_config import BaseConfig, Console
 from . import common_utils
 from .base_dataparser import BaseDataParser
-from .types import (
-    BatchDict,
-    DatasetItem,
-    DynamicMapInfosDict,
-    InternalFormatDict,
-    MapInfosDict,
-    MetaDriveType,
-    ObjectType,
-    PolylineType,
-    ProcessedDataDict,
-    RawScenarioDict,
-    Stage,
-    TrackInfosDict,
-    TracksToPredictDict,
-)
+from .types import (BatchDict, DatasetItem, DynamicMapInfosDict,
+                    InternalFormatDict, MapInfosDict, MetaDriveType,
+                    ObjectType, PolylineType, ProcessedDataDict,
+                    RawScenarioDict, Stage, TrackInfosDict,
+                    TracksToPredictDict)
 
 
 class DataParserConfig(BaseConfig["DataParser"]):
     """
-    Configuration for splitting and preprocessing raw ScenarioNet into cache shards.
+    Configuration object for `DataParser`, defining all preprocessing and cache-splitting behavior
+    for raw ScenarioNet-format datasets. Controls how trajectory and map data are parsed, sampled,
+    and filtered into model-ready format.
     """
 
     stage: Stage = Field(Stage.TRAIN)
-    """
-    STAGE.TRAIN, STAGE.VAL, STAGE.TEST
-    """
+    """Dataset split context ("train", "val", or "test")"""
 
     # Number of parallel workers (-1 = all CPUs)
-    num_workers: int = Field(-1, description="How many processes to spawn")
+    num_workers: int = Field(-1)
+    """Number of parallel processes for multiprocessing. Use -1 to utilize all available cores."""
 
     # When True, ignore any existing cache and rebuild
-    rebuild_dataset: bool = Field(False, description="Rebuild cache even if found")
+    rebuild_dataset: bool = Field(False)
+    """Whether to force rebuilding of preprocessed cache, even if it already exists."""
 
     # If True, only process `debug_samples` per split, single‐threaded, will rebuild in temp dir
-    is_debug: bool = Field(False, description="Debug: only few samples, no MP")
+    is_debug: bool = Field(False)
+    """Enables a debug mode with single-threaded processing, limited data, and temporary cache use."""
 
     # Data selection
-    num_debug_samples: Optional[int] = Field(
-        None, description="Max scenarios per split when debug=True"
-    )
+    num_debug_samples: Optional[int] = Field(None)
+    """Maximum number of scenarios to parse in debug mode per split."""
+
     starting_frame: List[int] = Field(
         [0],
-        description="History trajectory starts at this frame for each training dataset",
     )
+    """For each training dataset, indicates the starting index of the trajectory history (frame offset)."""
+
     max_data_num: List[Optional[int]] = Field(
         [None],
-        description="Maximum number of data for each training dataset, None means all data",
     )
+    """Optional cap for number of samples loaded per dataset. `None` uses the full set."""
 
     # Trajectory configuration
-    past_len: int = Field(21, description="History trajectory length, 2.1s")
-    future_len: int = Field(60, description="Future trajectory length, 6s")
+    past_len: int = Field(21)
+    """Number of past timesteps to consider (in frames). Defines the length of agent history used for prediction."""
+
+    future_len: int = Field(60)
+    """Number of future timesteps to predict (in frames). Ground truth will cover this interval."""
+
     trajectory_sample_interval: int = Field(
         1, description="Sample interval for the trajectory"
     )
+    """Subsampling rate along the temporal axis of trajectories. 1 = no subsampling."""
 
     # Object and map configuration
     masked_attributes: List[str] = Field(
         ["z_axis", "size"], description="Attributes to be masked in the input"
     )
+    """List of agent attributes to be zeroed out. Options include "z_axis", "size", "heading", etc."""
+
     allowed_line_types: List[str] = Field(
         default_factory=lambda: [
             "lane",
@@ -83,14 +80,15 @@ class DataParserConfig(BaseConfig["DataParser"]):
             "crosswalk",
             "speed_bump",
         ],
-        description="Allowed polyline types to be considered in the input",
     )
+    """Polyline categories to include from the map (e.g., "lane", "stop_sign")."""
 
     # Processing configuration
     only_train_on_ego: bool = Field(False, description="Only train on AV")
+    """If True, only predict the AV's trajectory"""
 
     # Which object types to include in parsing/filtering
-    object_types: List[ObjectType] = Field(
+    agent_types_to_predict: List[ObjectType] = Field(
         default_factory=lambda: [
             ObjectType.VEHICLE,
             ObjectType.PEDESTRIAN,
@@ -98,40 +96,51 @@ class DataParserConfig(BaseConfig["DataParser"]):
         ],
         description="Only include these ObjectType enums in filtering tracks",
     )
+    """Defines which object categories (VEHICLE, PEDESTRIAN, etc.) are retained for parsing."""
+
+    predict_specified_agents: bool = Field(
+        False,
+    )
+    """If True, only predict agents as specified in the dataset. If False, predict agents based on trajectory_filter."""
 
     # Map processing configuration
     center_offset_of_map: List[float] = Field(
         [30.0, 0.0], description="Center offset of the map"
     )
-    crop_agents: bool = Field(True)
-    max_num_agents: int = Field(32, description="Maximum number of agents")
-    max_num_roads: int = Field(256, description="Maximum number of road segments")
-    manually_split_lane: bool = Field(
-        False, description="Whether to manually split lane polylines"
-    )
-    map_range: float = Field(120.0, description="Range of the map in meters")
-    max_points_per_lane: int = Field(
-        20, description="Maximum number of points per lane segment"
-    )
-    point_sampled_interval: int = Field(
-        1, description="Sampling interval for points in polylines"
-    )
+    """XY offset from the AV used to center map crops. Applied before range filtering."""
+
+    crop_agents: bool = Field(False)
+    """If True, prunes agents outside the map crop region. Currently unimplemented."""
+
+    max_num_agents: int = Field(64)
+    """Maximum number of agents retained per sample after filtering and distance-based selection."""
+
+    max_num_roads: int = Field(256)
+    """Maximum number of road polylines retained per sample."""
+
+    manually_split_lane: bool = Field(False)
+    """Whether to manually divide long polylines into segments using distance thresholds."""
+
+    map_range: float = Field(120.0)
+    """Radius in meters used for filtering map elements (square crop centered on AV)."""
+
+    max_points_per_lane: int = Field(20)
+    """Maximum number of discrete points per lane segment (used for fixed-size input)."""
+
+    point_sampled_interval: int = Field(1)
+    """Sampling interval / step size when sampling points along raw polylines."""
+
     vector_break_dist_thresh: float = Field(
-        1.0, description="Distance threshold for breaking vectors"
+        1.0,
     )
-    num_points_each_polyline: int = Field(
-        20, description="Number of points in each polyline"
-    )
+    """Threshold for splitting polylines into new segments based on discontinuity in distance."""
+
+    num_points_each_polyline: int = Field(20)
+    """Target number of points in each polyline segment after resampling."""
 
     paths: PathConfig = Field(default_factory=PathConfig)
     """
-    Attributes (all of type Path):
-        root: Path to the root of the project
-        data: path to the data root
-        checkpoints
-        cache
-        temp_dir
-        split_data_output_dir
+    Stores all filesystem paths required for loading/writing datasets and cache.
     """
 
     target: Type["DataParser"] = Field(default_factory=lambda: DataParser)
@@ -148,15 +157,15 @@ class DataParserConfig(BaseConfig["DataParser"]):
         if self.is_debug:
             CONSOLE.log(
                 "Debug mode → single worker, limited to "
-                f"{self.num_debug_samples} samples, will use build in temp dir ({self.paths.temp_dir})"
+                f"{self.num_debug_samples} samples"
             )
             self.num_workers = 1
         else:
             # Use all available CPU cores if load_num_workers is < 0
             self.num_workers = self.get_num_workers()
             CONSOLE.log(
-                f"Using {self.num_workers}/{cpu_count()} workers;\n"
-                f"Rebuild dataset: {self.rebuild_dataset};\n"
+                f"Using {self.num_workers}/{cpu_count()} workers\n"
+                f"Rebuild dataset: {self.rebuild_dataset}\n"
             )
 
         # prefix removed automatically on new CONSOLE instances
@@ -381,28 +390,20 @@ class DataParser(BaseDataParser):
         ret["current_time_index"] = self.config.past_len - 1
         ret["sdc_track_index"] = track_infos["object_id"].index(ret["sdc_id"])
 
+        # Determine prediction agents based on config priorities
+        tracks_to_predict: TracksToPredictDict = {}
+        # 1. Ego only
         if self.config.only_train_on_ego:
             tracks_to_predict = {
                 "track_index": [ret["sdc_track_index"]],
                 "difficulty": [0],
                 "object_type": [MetaDriveType.VEHICLE],
             }
-        elif ret.get("tracks_to_predict", None) is None:
-            filtered_tracks = self.trajectory_filter(ret)
-            sample_list = list(filtered_tracks.keys())
-            tracks_to_predict = {
-                "track_index": [
-                    track_infos["object_id"].index(id)
-                    for id in sample_list
-                    if id in track_infos["object_id"]
-                ],
-                "object_type": [
-                    track_infos["object_type"][track_infos["object_id"].index(id)]
-                    for id in sample_list
-                    if id in track_infos["object_id"]
-                ],
-            }
-        else:
+        # 2. Predict filtered agents
+        elif (
+            ret.get("tracks_to_predict") is not None
+            and self.config.predict_specified_agents
+        ):
             sample_list = list(
                 ret["tracks_to_predict"].keys()
             )  # + ret.get('objects_of_interest', [])
@@ -419,7 +420,26 @@ class DataParser(BaseDataParser):
                     if id in track_infos["object_id"]
                 ],
             }
-
+        else:
+            filtered_tracks = self.trajectory_filter(ret)
+            sample_list = list(
+                set(filtered_tracks.keys()).union(
+                    (ret.get("tracks_to_predict") or dict()).keys()
+                )
+            )
+            tracks_to_predict = {
+                "track_index": [
+                    track_infos["object_id"].index(id)
+                    for id in sample_list
+                    if id in track_infos["object_id"]
+                ],
+                "object_type": [
+                    track_infos["object_type"][track_infos["object_id"].index(id)]
+                    for id in sample_list
+                    if id in track_infos["object_id"]
+                ],
+            }
+        # 3. Fallback
         ret["tracks_to_predict"] = tracks_to_predict
 
         ret["map_center"] = scenario["metadata"].get("map_center", np.zeros(3))[
@@ -595,7 +615,7 @@ class DataParser(BaseDataParser):
         if "heading" in masked_attributes:
             ret_dict["obj_trajs"][..., 23:25] = 0
 
-        # change every thing to float32
+        # change everything to float32
         for k, v in ret_dict.items():
             if isinstance(v, np.ndarray) and v.dtype == np.float64:
                 ret_dict[k] = v.astype(np.float32)
@@ -657,7 +677,6 @@ class DataParser(BaseDataParser):
         Returns:
             Optional[List[DatasetItem]]: List of data items with added post-processing info, or None if input is invalid.
         """
-        CONSOLE = Console.with_prefix(self.__class__.__name__, "postprocess")
         common_utils.get_kalman_difficulty(output)
         common_utils.get_trajectory_type(output)
 
@@ -665,75 +684,80 @@ class DataParser(BaseDataParser):
 
     def trajectory_filter(self, data: InternalFormatDict) -> Dict[str, Any]:
         """
-        Filter trajectories to select valid tracks for prediction.
+        Apply a sequence of validity and motion-based criteria to identify
+        which object tracks are suitable prediction targets.
+
+        The filtering logic enforces:
+          1. Type constraint: only VEHICLE, PEDESTRIAN, or CYCLIST.
+          2. Validity ratio: at least 50% of the track frames must be valid.
+          3. Movement threshold (vehicles only): total traveled distance ≥ 2 meters.
+          4. Present at prediction time: the object must be visible at current index.
+          5. Future continuity: ensures there is at least one valid future step
+             (identifies the first invalid future frame without discarding the track).
 
         Args:
-            data (InternalFormatDict): Internal format scenario data.
+            data (InternalFormatDict): Preprocessed scenario data containing
+                'track_infos.trajs' array of shape [N, S, D] and 'current_time_index'.
 
         Returns:
-            Dict[str, Any]: Dictionary of tracks to predict {object_id: info}.
+            Dict[str, Dict[str, Any]]: Mapping from object_id to a dict with keys:
+              - 'track_index' (int): index of the track in the trajs array.
+              - 'track_id' (str): original object identifier.
+              - 'difficulty' (int): placeholder difficulty score (0 = unknown).
+              - 'object_type' (str): raw type string of the object.
         """
-        CONSOLE = Console.with_prefix(
-            self.__class__.__name__, "trajectory_filter", self.config.stage.name
-        )
+        trajs = data["track_infos"]["trajs"]
+        current_idx = data["current_time_index"]
+        obj_summary = data["object_summary"]
 
-        tracks_to_predict_filtered = {}
-        try:
-            trajs = data["track_infos"]["trajs"]  # (num_obj, steps, feat)
-            obj_ids = data["track_infos"]["object_id"]
-            obj_types_enum = data["track_infos"]["object_type"]
-            current_idx = data["current_time_index"]
-            # object_summary might not exist, calculate necessary info directly
-            # obj_summary = data["object_summary"]
+        tracks_to_predict = {}
+        for idx, (k, v) in enumerate(obj_summary.items()):
+            type = v["type"]
 
-            selected_type_values = [ot.value for ot in self.config.object_types]
+            positions = trajs[idx, :, 0:2]
+            validity = trajs[idx, :, -1]
+            if type not in ["VEHICLE", "PEDESTRIAN", "CYCLIST"]:
+                continue
+            valid_ratio = v["valid_length"] / v["track_length"]
+            if valid_ratio < 0.5:
+                continue
+            moving_distance = v["moving_distance"]
+            if moving_distance < 2.0 and type == "VEHICLE":
+                continue
+            is_valid_at_m = validity[current_idx] > 0
+            if not is_valid_at_m:
+                continue
 
-            for i, obj_id in enumerate(obj_ids):
-                obj_type_enum = obj_types_enum[i]
-                if obj_type_enum not in selected_type_values:
-                    continue
+            # past_traj = positions[:current_idx+1, :]  # Time X (x,y)
+            # gt_future = positions[current_idx+1:, :]
+            # valid_past = count_valid_steps_past(validity[:current_idx+1])
 
-                positions = trajs[i, :, 0:2]
-                validity = trajs[i, :, -1]
-                track_length = len(validity)
-                valid_steps = validity > 0
-
-                # Check validity at current time
-                if not valid_steps[current_idx]:
-                    continue
-
-                # Check valid ratio
-                valid_ratio = np.sum(valid_steps) / track_length
-                if valid_ratio < 0.5:  # Configurable threshold?
-                    continue
-
-                # Check moving distance for vehicles
-                if obj_type_enum == ObjectType.VEHICLE.value:
-                    valid_positions = positions[valid_steps]
-                    if len(valid_positions) > 1:
-                        moving_distance = np.sum(
-                            np.linalg.norm(np.diff(valid_positions, axis=0), axis=1)
-                        )  # type: float
-                    else:
-                        moving_distance = 0
-                    if moving_distance < 2.0:  # Configurable threshold?
-                        continue
-
-                # If all checks pass, add to prediction list
-                tracks_to_predict_filtered[obj_id] = {
-                    "type_enum": obj_type_enum,
-                    # Add other relevant info if needed
-                }
-        except KeyError as e:
-            CONSOLE.error(
-                f"Missing key in trajectory_filter for scenario {data.get('scenario_id', 'Unknown')}: {e}"
-            )
-        except Exception as e:
-            CONSOLE.error(
-                f"Error in trajectory_filter for scenario {data.get('scenario_id', 'Unknown')}: {e}"
+            future_mask = validity[current_idx + 1 :]
+            future_mask[-1] = 0
+            idx_of_first_zero = np.where(future_mask == 0)[0]
+            idx_of_first_zero = (
+                len(future_mask)
+                if len(idx_of_first_zero) == 0
+                else idx_of_first_zero[0]
             )
 
-        return tracks_to_predict_filtered
+            # past_trajectory_valid = past_traj[-valid_past:, :]  # Time(valid) X (x,y)
+
+            # try:
+            #     kalman_traj = estimate_kalman_filter(past_trajectory_valid, idx_of_first_zero)  # (x,y)
+            #     kalman_diff = calculate_epe(kalman_traj, gt_future[idx_of_first_zero-1])
+            # except:
+            #     continue
+            # if kalman_diff < 20: continue
+
+            tracks_to_predict[k] = {
+                "track_index": idx,
+                "track_id": k,
+                "difficulty": 0,
+                "object_type": type,
+            }
+
+        return tracks_to_predict
 
     def get_agent_data(
         self,
@@ -886,21 +910,31 @@ class DataParser(BaseDataParser):
         max_num_agents = self.config.max_num_agents
         object_dist_to_center = np.linalg.norm(obj_trajs_data[:, :, -1, 0:2], axis=-1)
 
-        if self.config.crop_agents:
-            map_range = self.config.map_range  # reuse the same hyper-param
-            # same forward offset that map pruning uses
-            offset_xy = np.array(self.config.center_offset_of_map, dtype=np.float32)
-            offset_rot = common_utils.rotate_points_along_z(
-                offset_xy[None, :], center_objects[:, 6]
-            )
-            ego_box_center = center_objects[:, :2] + offset_rot
-            # mask agents whose LAST point is outside ROI
-            out_of_box = (
-                np.abs(obj_trajs_data[:, :, -1, 0] - offset_xy[0]) > map_range
-            ) | (np.abs(obj_trajs_data[:, :, -1, 1] - offset_xy[1]) > map_range)
-
         object_dist_to_center[obj_trajs_mask[..., -1] == 0] = 1e10
         topk_idxs = np.argsort(object_dist_to_center, axis=-1)[:, :max_num_agents]
+
+        # ===== FIX: Correctly map each center agent to its position in the topk list =====
+        track_index_to_predict_new = np.zeros(
+            len(track_index_to_predict), dtype=np.int64
+        )
+        for i, center_idx in enumerate(np.arange(num_center_objects)):
+            # Map from original index to index in the valid_past_mask filtered array
+            orig_idx_in_filtered = (
+                np.where(valid_past_mask)[0].tolist().index(track_index_to_predict[i])
+            )
+            # Find where this filtered index appears in the topk array for this center object
+            where_in_topk = np.where(topk_idxs[i] == orig_idx_in_filtered)[0]
+            if len(where_in_topk) > 0:
+                track_index_to_predict_new[i] = where_in_topk[0]
+            # If not found in topk (shouldn't happen since center agent should always be close to itself),
+            # keep it as 0 but log a warning
+            else:
+                CONSOLE = Console.with_prefix(self.__class__.__name__, "get_agent_data")
+                CONSOLE.warn(
+                    f"Center agent {i} (original idx: {track_index_to_predict[i]}) "
+                    f"not found in its own topk agents list! This may cause incorrect predictions."
+                )
+        # ===== End of FIX =====
 
         topk_idxs = np.expand_dims(topk_idxs, axis=-1)
         topk_idxs = np.expand_dims(topk_idxs, axis=-1)
@@ -916,9 +950,6 @@ class DataParser(BaseDataParser):
         )
         obj_trajs_future_mask = np.take_along_axis(
             obj_trajs_future_mask, topk_idxs[..., 0], axis=1
-        )
-        track_index_to_predict_new = np.zeros(
-            len(track_index_to_predict), dtype=np.int64
         )
 
         obj_trajs_data = np.pad(
@@ -1409,7 +1440,7 @@ class DataParser(BaseDataParser):
                     f"obj_idx={obj_idx} is not valid at time step {current_time_index}, scene_id={scene_id}"
                 )
                 continue
-            if obj_types[obj_idx] not in self.config.object_types:
+            if obj_types[obj_idx] not in self.config.agent_types_to_predict:
                 continue
 
             center_objects_list.append(obj_trajs_full[obj_idx, current_time_index])

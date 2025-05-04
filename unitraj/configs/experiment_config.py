@@ -1,18 +1,18 @@
-import os
-from pathlib import Path
-from typing import List, Optional, Union
+from multiprocessing import cpu_count
+from typing import List, Union
 
 import pytorch_lightning as pl
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from pydantic import Field
 from pytorch_lightning.callbacks import ModelCheckpoint  # Import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
 from ..datasets.base_dataset import DatasetConfig
+from ..datasets.dataparser import DataParserConfig
 from ..models.autobot.autobot import AutoBotConfig
-from ..utils.base_config import CONSOLE, BaseConfig
+from ..utils.base_config import BaseConfig, Console
 from ..utils.utils import find_latest_checkpoint, set_seed
 from .path_config import PathConfig
 
@@ -20,66 +20,12 @@ from .path_config import PathConfig
 class ExperimentConfig(BaseConfig):
     # experiment settings
     exp_name: str = Field("test", description="Name used in wandb and checkpoints")
-    ckpt_path: Optional[str] = Field(
-        None, description="Checkpoint path for resume/eval"
-    )
     seed: int = Field(42, description="Random seed for reproducibility")
     is_debug: bool = Field(True, description="Debug mode (CPU only)")
     devices: List[int] = Field([0], description="List of GPU device IDs")
-
-    # data loaders & paths
-    load_num_workers: int = Field(0, description="Num workers for DataLoader")
-    train_data_path: List[str] = Field(
-        ["/work/share/argoverse2_scenarionet/av2_scenarionet"],
-        description="Paths to training dataset shards",
-    )
-    val_data_path: List[str] = Field(
-        ["/work/share/argoverse2_scenarionet/av2_scenarionet"],
-        description="Paths to validation dataset shards",
-    )
-    cache_path: str = Field("./cache", description="Path to cache directory")
-
-    # dataset slicing
-    max_data_num: List[Optional[int]] = Field(
-        [None], description="Max samples per dataset (None = all)"
-    )
-    starting_frame: List[int] = Field(
-        [0], description="Starting frame for each dataset"
-    )
-
-    # trajectory params
-    past_len: int = Field(21, description="Length of observed history (frames)")
-    future_len: int = Field(60, description="Length of prediction horizon (frames)")
-    trajectory_sample_interval: int = Field(
-        1, description="Sampling interval for trajectory frames"
-    )
-
-    # filtering & map inputs
-    object_type: List[str] = Field(["VEHICLE"], description="Object types to include")
-    line_type: List[str] = Field(
-        ["lane", "stop_sign", "road_edge", "road_line", "crosswalk", "speed_bump"],
-        description="Types of map elements used",
-    )
-    masked_attributes: List[str] = Field(
-        ["z_axis", "size"], description="Attributes to mask in trajectory input"
-    )
-    only_train_on_ego: bool = Field(False, description="Train only on ego trajectories")
-    center_offset_of_map: List[float] = Field(
-        [30.0, 0.0], description="Map center offset in local frame"
-    )
-
-    # caching
-    use_cache: bool = Field(False, description="Whether to use disk cache")
-    overwrite_cache: bool = Field(False, description="Overwrite cached files")
-    store_data_in_memory: bool = Field(
-        False, description="Keep entire dataset in memory"
-    )
+    num_workers: int = Field(-1, description="Number of workers for data loading")
 
     # evaluation settings
-    nuscenes_dataroot: Optional[str] = Field(
-        None,
-        description="Path to nuScenes dataset root for evaluation",
-    )
     eval_nuscenes: bool = Field(False, description="Use nuScenes evaluation tool")
     eval_waymo: bool = Field(False, description="Use Waymo evaluation tool")
     eval_argoverse2: bool = Field(False, description="Use Argoverse2 evaluation tool")
@@ -97,7 +43,18 @@ class ExperimentConfig(BaseConfig):
         torch.set_float32_matmul_precision("medium")
         set_seed(self.seed)
 
+        CONSOLE = Console.with_prefix(self.__class__.__name__, "setup_target")
         CONSOLE.set_debug(self.is_debug)
+
+        if self.is_debug:
+            self.num_workers = 1
+        else:
+            if (
+                self.num_workers == -1
+                or self.num_workers is None
+                or self.num_workers > cpu_count()
+            ):
+                self.num_workers = cpu_count()
 
         model = self.method.setup_target()
         # Override dataset paths with experiment data paths
@@ -118,7 +75,7 @@ class ExperimentConfig(BaseConfig):
         train_loader = DataLoader(
             train_set,
             batch_size=train_batch_size,
-            num_workers=self.load_num_workers,
+            num_workers=self.num_workers,
             drop_last=False,
             collate_fn=train_set.collate_fn,
         )
@@ -126,7 +83,7 @@ class ExperimentConfig(BaseConfig):
         val_loader = DataLoader(
             val_set,
             batch_size=eval_batch_size,
-            num_workers=self.load_num_workers,
+            num_workers=self.num_workers,
             shuffle=False,
             drop_last=False,
             collate_fn=train_set.collate_fn,
@@ -161,7 +118,7 @@ class ExperimentConfig(BaseConfig):
             callbacks=callbacks,
         )
 
-        if self.ckpt_path is None and not self.is_debug:
+        if self.paths.checkpoints is not None and not self.is_debug:
             # search_pattern = os.path.join("./unitraj", self.exp_name, "**", "*.ckpt")
             search_pattern = self.paths.checkpoints / self.exp_name / "**" / "*.ckpt"
             ckpt_path = find_latest_checkpoint(search_pattern.as_posix())

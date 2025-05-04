@@ -7,3 +7,10 @@ einops
 easydict
 panda3d-simplepbr==0.10
 h5py
+
+## New dependencies
+pandarallel
+pandas
+pydantic
+rich
+devtools

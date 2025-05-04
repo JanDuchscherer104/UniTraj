@@ -10,16 +10,19 @@ from torch import Tensor, int64
 # -----------------------------------------------------------------------------
 # Shape symbol key used throughout docstrings
 #   T – number of timesteps in raw data
-#   P – past trajectory length (past_len)
-#   F – future trajectory length (future_len)
-#   S – total trajectory steps (S = P + F)
-#   N – number of objects / agents in a scenario
-#   A – maximum number of agents kept per sample (max_num_agents)
-#   R – maximum number of road polylines kept (max_roads)
+#   Tp – past trajectory length (past_len) (prev P)
+#   Tf – future trajectory length (future_len) (prev F)
+#   T – total trajectory steps (S = Tp + Tf) (prev S)
+#   N – number of active agents in a scenario
+#   A - number of center agents (whose future we want to predict) (prev B)
+#   Nmax – maximum number of agents kept per sample (max_num_agents) (prev A)
+#   K – maximum number of road polylines kept (max_roads)
 #   L – number of points per polyline segment (num_points_each_polyline)
 #   C – coordinate dimension (2 = x,y or 3 = x,y,z)
-#   D – generic feature dimension
-#   B – batch size / number of “center” agents drawn from a scenario
+#   Fap – feature dimension for all agents in historical data.
+#   Faf - feature dimension for all agents in future data.
+#   Fmap - feature dimension for map polylines
+#   B – batch size
 # -----------------------------------------------------------------------------
 
 # Type alias for object ID (usually string)
@@ -194,45 +197,105 @@ class ProcessedDataDict(TypedDict):
     """Structure holding processed data for multiple agents (batch-like before splitting)."""
 
     scenario_id: np.ndarray
-    """[B] Scenario ID for each center agent."""
+    """[A] Scenario ID for each center agent.
+
+    Each entry uniquely identifies the scenario from which the corresponding center agent is drawn. This allows for tracking and grouping predictions by scenario during evaluation and debugging.
+    """
     obj_trajs: np.ndarray
-    """[B, A, P, D] Past trajectories of all objects relative to each center agent."""
+    """[A, Nmax, Tp, Fap] Past trajectories of all objects relative to each center agent.
+
+    Captures the historical movement data for all agents in a scene, for each center agent in the batch. These trajectories are crucial for learning spatiotemporal patterns, which underpin the prediction of future behaviors. Each trajectory is normalized relative to the center agent at the current timestep, ensuring consistency across samples. The feature dimension Fap may include positions, velocities, headings, etc.
+    """
     obj_trajs_mask: np.ndarray
-    """[B, A, P] Mask for past trajectories."""
+    """[A, Nmax, Tp] Mask for past trajectories.
+
+    Boolean mask indicating the validity of each past trajectory entry. Used to ignore padded or missing data during training and evaluation.
+    """
     track_index_to_predict: np.ndarray
-    """[B] Index of the center agent within A."""
+    """[A] Index of the center agent within Nmax.
+
+    For each sample in the batch, this gives the index of the "center" agent (the agent for which prediction is made) within the set of Nmax agents considered for that sample. This enables models to distinguish the target agent from its context and is essential for supervised learning and evaluation.
+    """
     obj_trajs_pos: np.ndarray
-    """[B, A, P, 3] Past positions (x, y, z)."""
+    """[A, Nmax, Tp, C] Past positions (x, y, z).
+
+    The raw spatial locations of all agents for each timestep in the past window, relative to the center agent.
+    """
     obj_trajs_last_pos: np.ndarray
-    """[B, A, 3] Last valid past position for each object."""
+    """[A, Nmax, C] Last valid past position for each object.
+
+    For each agent, provides the most recent valid position in the past window, often used for initialization or as a reference point for future prediction.
+    """
     center_objects_world: np.ndarray
-    """[B, 10] World‑frame state of each center agent at t=0."""
+    """[A, 10] World-frame state of each center agent at t=0.
+
+    The complete state vector (positions, velocities, heading, etc.) of the center agent at the current time in global/world coordinates. This serves as a reference for denormalization and for model input features.
+    """
     center_objects_id: np.ndarray
-    """[B] Object ID of each center agent."""
+    """[A] Object ID of each center agent.
+
+    Unique identifier for the center agent in each sample, useful for mapping predictions back to the original data.
+    """
     center_objects_type: np.ndarray
-    """[B] Object type enum of each center agent."""
+    """[A] Object type enum of each center agent.
+
+    Integer code representing the semantic type of the center agent (e.g., vehicle, pedestrian, cyclist).
+    """
     map_center: np.ndarray
-    """[B, 1, 3] Map center used for normalization."""
+    """[A, 1, C] Map center used for normalization.
+
+    The central point of the map region for each sample, used to normalize coordinates and ensure translation invariance. Normalizing by the map center helps models generalize across different map locations and scales.
+    """
     obj_trajs_future_state: np.ndarray
-    """[B, A, F, 4] Future states (x, y, vx, vy)."""
+    """[A, Nmax, Tf, Faf] Future states (x, y, vx, vy).
+
+    Ground-truth or reference future states for all agents, including position and velocity, relative to the center agent's frame.
+    """
     obj_trajs_future_mask: np.ndarray
-    """[B, A, F] Mask for future states."""
+    """[A, Nmax, Tf] Mask for future states.
+
+    Boolean mask indicating valid future trajectory entries for each agent.
+    """
     center_gt_trajs: np.ndarray
-    """[B, F, 4] Ground‑truth future trajectory of center agents."""
+    """[A, Tf, Faf] Ground-truth future trajectory of center agents.
+
+    The true future trajectory (position and velocity) for each center agent in the batch. This is the primary supervision target for trajectory prediction models.
+    """
     center_gt_trajs_mask: np.ndarray
-    """[B, F] Mask for ground‑truth future points."""
+    """[A, Tf] Mask for ground-truth future points.
+
+    Boolean mask indicating which points in the ground-truth future trajectory are valid and should be used for loss computation.
+    """
     center_gt_final_valid_idx: np.ndarray
-    """[B] Index of last valid GT point."""
+    """[A] Index of last valid GT point.
+
+    For each center agent, gives the index of the last valid point in its future trajectory. Useful for variable-length trajectory handling.
+    """
     center_gt_trajs_src: np.ndarray
-    """[B, S, 10] Original world‑frame trajectory of center agents."""
+    """[A, T, 10] Original world-frame trajectory of center agents.
+
+    The full trajectory (past + future) for each center agent in world coordinates, including all available features (positions, velocities, etc.). Useful for evaluation and visualization.
+    """
     map_polylines: np.ndarray
-    """[B, R, L, 29] Map polyline features relative to each center agent."""
+    """[A, K, L, Fmap] Map polyline features relative to each center agent.
+
+    Contains the geometric and semantic features of the map (e.g., lane boundaries, crosswalks) for each sample, centered and normalized to the center agent. Each polyline is represented by L points, and K is the maximum number of polylines considered. The feature dimension (Fmap) may include coordinates, heading, type encoding, and other attributes.
+    """
     map_polylines_mask: np.ndarray
-    """[B, R, L] Mask for map polylines."""
+    """[A, K, L] Mask for map polylines.
+
+    Boolean mask indicating valid points within each map polyline segment.
+    """
     map_polylines_center: np.ndarray
-    """[B, R, 3] Center of each polyline segment."""
+    """[A, K, C] Center of each polyline segment.
+
+    For each map polyline segment, provides the centroid or reference point in normalized coordinates. Useful for spatial reasoning and pooling operations.
+    """
     dataset_name: List[str]
-    """[B] Name of the source dataset."""
+    """[A] Name of the source dataset.
+
+    Indicates the origin dataset for each sample in the batch. This is important for multi-dataset training or cross-dataset evaluation.
+    """
 
 
 class DatasetItem(BaseModel):
@@ -243,95 +306,168 @@ class DatasetItem(BaseModel):
     @field_validator("scenario_id", "center_objects_id", "dataset_name", mode="before")
     @classmethod
     def _validate_str_fields(cls, v):
-        # Handle numpy scalar/array
         if isinstance(v, (np.generic, np.ndarray)):
             try:
                 v = v.item()
             except Exception:
                 pass
-        # Decode bytes to str
         if isinstance(v, (bytes, bytearray)):
             return v.decode("utf-8")
-        # If already str, leave unchanged
         if isinstance(v, str):
             return v
         return v
 
-    scenario_id: str = Field(..., description="Scenario unique ID (|S36)")
+    scenario_id: str = Field(...)
+    """Scenario unique ID (|S36)
 
-    obj_trajs: np.ndarray = Field(
-        ..., description="Past trajectories: shape (A, P, 39)"
-    )
-    obj_trajs_mask: np.ndarray = Field(
-        ..., description="Mask for past traj points: shape (A, P)"
-    )
-    track_index_to_predict: np.int64 = Field(
-        ..., description="Index of agent-to-predict in [0,A)"
-    )
+    A unique string identifier for the scenario from which this sample is drawn. Used for grouping, tracking, and evaluation.
+    """
 
-    obj_trajs_pos: np.ndarray = Field(
-        ..., description="Past positions (x,y,z): shape (A, P, 3)"
-    )
-    obj_trajs_last_pos: np.ndarray = Field(
-        ..., description="Last valid pos per agent: shape (A, 3)"
-    )
+    obj_trajs: np.ndarray = Field(...)
+    """[Nmax, Tp, Fap] Past trajectories of all agents.
 
-    center_objects_world: np.ndarray = Field(
-        ..., description="World-frame state of predicted agent: shape (10,)"
-    )
-    center_objects_id: str = Field(..., description="Agent ID (|S4)")
-    center_objects_type: np.int64 = Field(..., description="Agent type enum")
+    Historical trajectory data for Nmax agents in the sample, for Tp past steps, and Fap features.
+    These are normalized relative to the center agent, which is critical for learning scene-invariant motion patterns.
+    The Fap dimension (e.g., 39) consists of:
+    - [0:3] Relative Position: x, y, z relative to center agent at t=0.
+    - [3:6] Size length, width, height of the object.
+    - [6:11] Object Type & Role Mask (5 features): One-hot encoding (VEHICLE, PEDESTRIAN, CYCLIST, CENTER, SDC).
+    - [11:11+Tp] One-hot Time Embedding; A := 11 + Tp
+    - [A:A+2] Heading Embedding (2 features): Sine and cosine of the agent's heading relative to the center agent's heading at t=0.
+    - [A+2:A+4] Relative Velocity (2 features): vx, vy relative to center agent frame.
+    - [A+4:Fap] Relative Acceleration (2 features): ax, ay relative to center agent frame.
+    """
 
-    map_center: np.ndarray = Field(
-        ..., description="Map center for normalization: shape (3,)"
-    )
+    obj_trajs_mask: np.ndarray = Field(...)
+    """[Nmax, Tp] Mask for past trajectory entries.
 
-    obj_trajs_future_state: np.ndarray = Field(
-        ..., description="Future states (x,y,vx,vy): shape (A, F, 4)"
-    )
-    obj_trajs_future_mask: np.ndarray = Field(
-        ..., description="Mask for future traj points: shape (A, F)"
-    )
+    Boolean mask indicating which entries in obj_trajs are valid (not padded or missing).
+    """
 
-    center_gt_trajs: np.ndarray = Field(
-        ..., description="GT future traj (x,y,vx,vy): shape (F, 4)"
-    )
-    center_gt_trajs_mask: np.ndarray = Field(
-        ..., description="Mask for GT future points: shape (F,)"
-    )
-    center_gt_final_valid_idx: float = Field(
-        ..., description="Index of last valid GT point"
-    )
-    center_gt_trajs_src: np.ndarray = Field(
-        ..., description="Original world traj: shape (S, 10)"
-    )
+    track_index_to_predict: np.int64 = Field(...)
+    """Index of agent-to-predict in [0, Nmax). Typically 0.
 
-    map_polylines: np.ndarray = Field(
-        ..., description="Map polyline feats: shape (R, L, 29)"
-    )
-    map_polylines_mask: np.ndarray = Field(
-        ..., description="Mask for map polyline points: shape (R, L)"
-    )
-    map_polylines_center: np.ndarray = Field(
-        ..., description="Center (x,y,z) per polyline: shape (R, 3)"
-    )
+    The integer index of the "center" agent (the prediction target) within the set of all Nmax agents in this sample.
+    This index is crucial for extracting the correct ground-truth trajectory and for associating predictions with the
+    correct agent.
+    """
 
-    dataset_name: str = Field(..., description="Source dataset name (|S38)")
+    obj_trajs_pos: np.ndarray = Field(...)
+    """[Nmax, Tp, C] Past positions (x, y, z).
 
-    # Added by postprocess
-    kalman_difficulty: Optional[np.ndarray] = Field(
-        None, description="Optional Kalman difficulty: shape (K,)"
-    )
-    trajectory_type: Optional[int] = Field(
-        None, description="Optional trajectory type enum"
-    )
+    The actual spatial positions for all agents and all past steps, with C=3 for 3D coordinates.
+    """
+
+    obj_trajs_last_pos: np.ndarray = Field(...)
+    """[Nmax, C] Last valid position per agent.
+
+    The most recent valid position in the past window for each agent, useful for initializing predictions or for
+    computing relative motion.
+    """
+
+    center_objects_world: np.ndarray = Field(...)
+    """[10] World-frame state of center agent at t=0.
+
+    The full state vector (positions, velocities, heading, etc.) for the center agent at the current time, in
+    absolute/world coordinates. This is essential for denormalizing predictions and for model input.
+
+    (x, y, z, length, width, height, heading, vx, vy, valid)
+    """
+
+    center_objects_id: str = Field(...)
+    """Center agent ID within the scenario.
+
+    Unique identifier for the center agent in this sample, used for mapping predictions back to the original scenario data.
+    """
+
+    center_objects_type: np.int64 = Field(...)
+    """Center agent type.
+
+    Integer code for the semantic type (e.g., vehicle, pedestrian) of the center agent.
+    0: UNSET, 1: VEHICLE, 2: PEDESTRIAN, 3: CYCLIST, 4: OTHER
+    """
+
+    map_center: np.ndarray = Field(...)
+    """[C] Map center for normalization. Typically (0, 0, 0) (agent-centered).
+
+    The reference point in map/world coordinates used to normalize all positions in this sample, ensuring translation invariance. This helps models generalize across locations.
+    """
+
+    obj_trajs_future_state: np.ndarray = Field(...)
+    """[Nmax, Tf, Faf] Future states Faf = (x, y, vx, vy).
+
+    The ground-truth or reference future states for all agents, including position and velocity, for Tf future steps.
+    """
+
+    obj_trajs_future_mask: np.ndarray = Field(...)
+    """[Nmax, Tf] Mask for future trajectory entries.
+
+    Boolean mask indicating which entries of obj_trajs_future_state are valid.
+    """
+
+    center_gt_trajs: np.ndarray = Field(...)
+    """[Tf, Faf] GT future trajectory (x, y, vx, vy).
+
+    The ground-truth future trajectory for the center agent, including position and velocity at each of Tf future timesteps. This is the main supervision signal for trajectory prediction.
+    """
+
+    center_gt_trajs_mask: np.ndarray = Field(...)
+    """[Tf] Mask for GT future trajectory entries.
+
+    Boolean mask indicating which future trajectory points for the center agent are valid (not padded).
+    """
+
+    center_gt_final_valid_idx: float = Field(...)
+    """Index of last valid GT point.
+
+    The (possibly fractional) index of the last valid ground-truth future point for the center agent. This is useful for handling variable-length future trajectories.
+    """
+
+    center_gt_trajs_src: np.ndarray = Field(...)
+    """[T, 10] Original world-frame trajectory.
+
+    The entire (past + future) trajectory of the center agent in world coordinates, including all 10 features. Used for visualization and evaluation.
+    """
+
+    map_polylines: np.ndarray = Field(...)
+    """[K, L, Fmap] Map polyline features.
+
+    Contains K polylines (e.g., lanes, crosswalks), each with L points, and Fmap features per point (such as position, heading, type, etc.), all normalized relative to the center agent. These features provide the context of the static environment for prediction.
+    """
+
+    map_polylines_mask: np.ndarray = Field(...)
+    """[K, L] Mask for map polylines.
+
+    Boolean mask indicating which points in the map polylines are valid.
+    """
+
+    map_polylines_center: np.ndarray = Field(...)
+    """[K, C] Center point per polyline.
+
+    The centroid or reference point for each polyline segment, used for pooling and spatial reasoning.
+    """
+
+    dataset_name: str = Field(...)
+    """Source dataset name (|S38)
+
+    Indicates the name of the dataset from which this sample was drawn, which is important for multi-dataset experiments or analysis.
+    """
+
+    kalman_difficulty: Optional[np.ndarray] = Field(None)
+    """[K] Optional Kalman difficulty scores.
+
+    If available, provides a difficulty estimate for the sample, e.g., based on Kalman filter residuals.
+    """
+
+    trajectory_type: Optional[int] = Field(None)
+    """Optional trajectory type enum.
+
+    Integer code indicating a trajectory class (e.g., straight, turning, etc.), if provided.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
 
     def to_tensor_dict(self) -> Dict[str, Any]:
-        """
-        Convert all numpy arrays to torch.Tensors.
-        """
         import torch
 
         tdict = {}
@@ -343,10 +479,6 @@ class DatasetItem(BaseModel):
         return tdict
 
     def summary(self) -> str:
-        """
-        Returns a one-line summary: scenario_id, dataset_name, #agents, #past, #future, #map_polylines.
-        """
-        # decode bytes fields for readability
         sid = (
             self.scenario_id.decode("utf-8")
             if isinstance(self.scenario_id, (bytes, bytearray))
@@ -357,15 +489,40 @@ class DatasetItem(BaseModel):
             if isinstance(self.dataset_name, (bytes, bytearray))
             else str(self.dataset_name)
         )
-        n_agents, n_past, _ = self.obj_trajs.shape
-        n_future = self.center_gt_trajs.shape[0]
-        # number of static map polylines
-        map_count = self.map_polylines.shape[0]
+        n_agents_max, n_past, agent_past_feat_dim = self.obj_trajs.shape
+        n_active_agents = np.sum(np.any(self.obj_trajs_last_pos != 0, axis=1)).item()  # type: ignore
+        _, n_future, agent_future_feat_dim = self.obj_trajs_future_state.shape
+
+        map_count, map_points, map_feat_dim = self.map_polylines.shape
+
+        kd_info = (
+            f", kd={self.kalman_difficulty.shape}"
+            if self.kalman_difficulty is not None
+            else ""
+        )
+        traj_type_info = (
+            f", traj_type={self.trajectory_type}"
+            if self.trajectory_type is not None
+            else ""
+        )
+
         return (
             f"<DatasetItem {sid!r} @ {ds!r}: "
-            f"agents={n_agents}, past={n_past}, future={n_future}, "
-            f"map_polylines={map_count}>"
+            f"Agents={n_active_agents}/{n_agents_max}, "
+            f"Traj(P={n_past}, F={n_future}, D_past={agent_past_feat_dim}, D_future={agent_future_feat_dim}), "
+            f"Map(R={map_count}, L={map_points}, D_map={map_feat_dim})"
+            f"{kd_info}{traj_type_info}>"
         )
+
+    def print_shapes(self):
+        """Prints the name and shape (for numpy arrays) or type (for others) of each field."""
+        print(f"--- Shapes for DatasetItem ({self.scenario_id}) ---")
+        for name, value in self.model_dump().items():
+            if isinstance(value, np.ndarray):
+                print(f"{name}: {value.shape}")
+            else:
+                print(f"{name}: {type(value)}")
+        print("-------------------------------------------------")
 
 
 # --- Batch Data (Output of collate_fn) ---
@@ -373,49 +530,43 @@ class BatchInputDict(TypedDict):
     """Structure of the input_dict within BatchDict (usually tensors)."""
 
     scenario_id: List[str]
-    """List of scenario IDs in the batch."""
+    """[B] List of scenario IDs in the batch."""
     obj_trajs: Tensor
-    """[batch_size, max_num_agents, past_len, num_features] Batched past trajectories."""
+    """[B, Nmax, Tp, Fap] Batched past trajectories."""
     obj_trajs_mask: Tensor
-    """[batch_size, max_num_agents, past_len] Batched mask for past trajectories."""
+    """[B, Nmax, Tp] Batched mask for past trajectories."""
     track_index_to_predict: Tensor
-    """[batch_size,] Batched index of the agent-to-predict."""
+    """[B] Batched index of the agent-to-predict."""
     obj_trajs_pos: Tensor
-    """[batch_size, max_num_agents, past_len, 3] Batched past positions."""
+    """[B, Nmax, Tp, C] Batched past positions."""
     obj_trajs_last_pos: Tensor
-    """[batch_size, max_num_agents, 3] Batched last valid past positions."""
+    """[B, Nmax, C] Batched last valid past positions."""
     center_objects_world: Tensor
-    """[batch_size, 10] Batched world-frame state of the agent-to-predict."""
+    """[B, 10] Batched world-frame state of each center agent at t=0."""
     center_objects_id: List[ObjectID]
-    """List of object IDs for the agents-to-predict in the batch."""
+    """[B] List of center agent IDs."""
     center_objects_type: Tensor
-    """[batch_size,] Batched object type of the agent-to-predict."""
+    """[B] Batched object type enums."""
     map_center: Tensor
-    """[batch_size, 1, 3] Batched map centers."""
+    """[B, 1, C] Batched map centers."""
     obj_trajs_future_state: Tensor
-    """[batch_size, max_num_agents, future_len, 4] Batched future states."""
+    """[B, Nmax, Tf, Faf] Batched future states (x, y, vx, vy)."""
     obj_trajs_future_mask: Tensor
-    """[batch_size, max_num_agents, future_len] Batched mask for future states."""
+    """[B, Nmax, Tf] Batched mask for future states."""
     center_gt_trajs: Tensor
-    """[batch_size, future_len, 4] Batched ground truth future trajectories."""
+    """[B, Tf, Faf] Batched ground truth future trajectories."""
     center_gt_trajs_mask: Tensor
-    """[batch_size, future_len] Batched mask for ground truth future trajectories."""
+    """[B, Tf] Batched mask for ground truth."""
     center_gt_final_valid_idx: Tensor
-    """[batch_size,] Batched index of the last valid ground truth future point."""
+    """[B] Batched index of last valid ground truth point."""
     center_gt_trajs_src: Tensor
-    """[batch_size, total_steps, 10] Batched original world-frame trajectories."""
+    """[B, T, 10] Batched original world-frame trajectories."""
     map_polylines: Tensor
-    """[batch_size, max_roads, max_points, map_feat_dim] Batched map polyline features."""
+    """[B, K, L, Fmap] Batched map polyline features."""
     map_polylines_mask: Tensor
-    """[batch_size, max_roads, max_points] Batched mask for map polyline points."""
+    """[B, K, L] Batched polyline masks."""
     map_polylines_center: Tensor
-    """[batch_size, max_roads, 3] Batched center points for map polylines."""
-    dataset_name: List[str]
-    """List of dataset names in the batch."""
-    kalman_difficulty: Tensor
-    """[batch_size,] Batched Kalman difficulty scores."""
-    trajectory_type: Tensor
-    """[batch_size,] Batched trajectory type classifications."""
+    """[B, K, C] Batched polyline centers."""
 
 
 class BatchDict(TypedDict):

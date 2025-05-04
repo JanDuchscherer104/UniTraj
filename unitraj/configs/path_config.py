@@ -1,10 +1,10 @@
-import shutil
 from pathlib import Path
 from typing import Annotated, List, Optional, Type, Union
 
 from pydantic import Field, ValidationInfo, field_validator
 
-from ..utils.base_config import CONSOLE, SingletonConfig
+from ..datasets.types import Stage
+from ..utils.base_config import Console, SingletonConfig
 
 
 class PathConfig(SingletonConfig):
@@ -15,40 +15,32 @@ class PathConfig(SingletonConfig):
     path validation and creation when needed.
     """
 
-    root: Path = Field(default_factory=lambda: Path(__file__).parents[4].resolve())
-
-    # Standard paths
-    data: Annotated[
-        Path, Field(default="/work/share/argoverse2_scenarionet/av2_scenarionet")
-    ]
-    """Base directory for all data."""
-
+    root: Path = Field(default_factory=lambda: Path(__file__).parents[5].resolve())
     checkpoints: Annotated[Path, Field(default=".logs/checkpoints")]
     """Directory for model checkpoints."""
-
     configs: Annotated[Path, Field(default=".configs")]
     """Directory for configuration files."""
 
-    cache: Annotated[Path, Field(default=".cache")]
-    """Directory for cached dataset files."""
-
-    temp_dir: Annotated[Path, Field(default=".temp_dir")]
-    """Directory for temporary files during data processing."""
-
-    split_data_output_dir: Annotated[Path, Field(default="split_data_output")]
-    """Directory to copy data to when using the split_data function."""
-
-    # External datasets paths
-    # nuscenes_root: Optional[Annotated[Path, Field(default=None)]]
-    # """Path to the nuScenes dataset root directory."""
+    # Data paths
+    data_root: Annotated[Path, Field(default="/work/share/traj-pred-data")]
+    """Base directory for all data."""
+    scenarionet_dirs: Annotated[
+        List[Path],
+        Field(
+            default_factory=lambda: [
+                "argoverse2_scenarionet/av2_scenarionet",
+            ]
+        ),
+    ]
+    argoverse2_dir: Annotated[Path, Field(default="argoverse2/motion-forecasting")]
+    """List of directories containing ScenarioNet datasets. Relative to data_root."""
+    dataset_dest_dir: Annotated[Path, Field(default="av2_sn_processed")]
+    """Directory to store the processed dataset. Relative to data_root."""
 
     @field_validator(
-        "data",
+        "data_root",
         "checkpoints",
         "configs",
-        "cache",
-        "split_data_output_dir",
-        "temp_dir",
         mode="before",
     )
     @classmethod
@@ -63,86 +55,86 @@ class PathConfig(SingletonConfig):
         Returns:
             Path: The validated Path object.
         """
+        CONSOLE = Console.with_prefix(cls.__name__, "convert_to_path")
+
         if isinstance(v, str):
             root = info.data.get("root", Path.cwd())
             v = root / v if not Path(v).is_absolute() else Path(v)
         v = v.resolve()
-        # Use ensure_dir method
-        cls.ensure_dir(v)
+
+        if not v.exists():
+            try:
+                v.mkdir(parents=True, exist_ok=True)
+                CONSOLE.log(f"Created directory: {v}")
+            except Exception as e:
+                CONSOLE.error(f"Failed to create directory {v}: {e}")
+                raise
+
+        assert v.exists(), f"Path does not exist: {v}"
+
         return v
 
-    # @field_validator(
-    #     "nuscenes_root",
-    #     mode="before",
-    # )
-    # @classmethod
-    # def validate_optional_path(
-    #     cls, v: Optional[Union[str, Path]], info: ValidationInfo
-    # ) -> Optional[Path]:
-    #     """
-    #     Validate optional path fields.
+    @field_validator("scenarionet_dirs", mode="before")
+    @classmethod
+    def convert_scenarionet_dirs(cls, v: List[str], info: ValidationInfo) -> List[Path]:
+        """
+        Convert scenario net directories to Path objects.
 
-    #     Args:
-    #         v (Optional[Union[str, Path]]): The optional path to validate.
-    #         info (ValidationInfo): Additional validation context.
+        Args:
+            v (Union[str, Path]): The path value to convert.
+            info (ValidationInfo): Additional validation context.
 
-    #     Returns:
-    #         Optional[Path]: The validated Path object or None.
-    #     """
-    #     if v is None:
-    #         return None
+        Returns:
+            List[Path]: The validated list of Path objects.
+        """
+        assert len(v) > 0, "`path_config.scenarionet_dirs` cannot be empty."
 
-    #     if isinstance(v, str):
-    #         root = info.data.get("root", Path.cwd())
-    #         v = root / v if not Path(v).is_absolute() else Path(v)
+        paths: List[Path] = []
+        for raw_path in v:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = info.data["data_root"] / path
+            assert path.exists(), f"Scenarionet path does not exist: {path}"
+            paths.append(path.resolve())
 
-    #     return v.resolve()
+        return paths
 
-    @staticmethod
-    def ensure_dir(path: Path):
-        """Ensure a directory exists, creating it if necessary."""
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            CONSOLE.error(f"Failed to create directory {path}: {e}")
-            raise
+    @field_validator("dataset_dest_dir", mode="before")
+    @classmethod
+    def convert_dataset_dest_dir(cls, v: str, info: ValidationInfo) -> Path:
+        root = info.data["data_root"]
+        path = (root / v if not Path(v).is_absolute() else Path(v)).resolve()
 
-    @staticmethod
-    def remove_dir(path: Path):
-        """Remove a directory and its contents."""
-        if path.exists():
-            try:
-                shutil.rmtree(path)
-                CONSOLE.log(f"Removed directory: {path}")
-            except Exception as e:
-                CONSOLE.error(f"Failed to remove directory {path}: {e}")
-                raise
-        else:
-            CONSOLE.warn(f"Attempted to remove non-existent directory: {path}")
-
-    @staticmethod
-    def check_exists(path: Path) -> bool:
-        """Check if a path exists."""
-        return path.exists()
-
-    def get_cache_path(self, dataset_name: str, phase: str) -> Path:
-        """Get the cache path for a specific dataset and phase."""
-        path = self.cache / dataset_name / phase
-        self.ensure_dir(path)
+        path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def get_temp_path(self, dataset_name: str, phase: str) -> Path:
-        """Get the temporary path for a specific dataset and phase."""
-        path = self.temp_dir / dataset_name / phase
-        self.ensure_dir(path)
+    @field_validator("argoverse2_dir", mode="before")
+    @classmethod
+    def convert_dir_rel_data(cls, v: str, info: ValidationInfo) -> Path:
+        root = info.data["data_root"]
+        path = (root / v if not Path(v).is_absolute() else Path(v)).resolve()
+
+        assert path.exists(), f"Argoverse2 path does not exist: {path}"
         return path
 
-    def get_temp_split_path(self, dataset_name: str, phase: str, index: int) -> Path:
-        """Get the path for a temporary data split file."""
-        temp_path = self.get_temp_path(dataset_name, phase)
-        return temp_path / f"{index}.pkl"
+    def find_av2_split(self, scenario_id: str) -> Optional[Stage]:
+        for stage in Stage:
+            split_dir = self.argoverse2_dir / str(stage)
+            assert split_dir.exists(), f"Split directory does not exist: {split_dir}"
 
-    def get_cache_chunk_path(self, dataset_name: str, phase: str, index: int) -> Path:
-        """Get the path for a cached data chunk (HDF5 file)."""
-        cache_path = self.get_cache_path(dataset_name, phase)
-        return cache_path / f"{index}.h5"
+            if (split_dir / scenario_id).exists():
+                return stage
+
+        return None
+
+    def get_sample_metadata_path(self, stage: Stage) -> Path:
+        """
+        Get the path to the sample metadata file for a given stage.
+
+        Args:
+            stage (Stage): The stage of the dataset.
+
+        Returns:
+            Path: The path to the sample metadata pickle file.
+        """
+        return self.dataset_dest_dir / f"sampe_metadata{stage.name.lower()}.pkl"

@@ -24,30 +24,123 @@ from rich.theme import Theme
 from rich.tree import Tree
 
 
-class _Console(RichConsole):
-    _instance = None
-    _lock: Lock = Lock()
+class Console(RichConsole):
+    # TODO: get prefix automatically from caller (via caller stack?)
     is_debug: bool
+    prefix: Optional[str] = None
 
-    def __new__(cls, *args, verbose: bool = True, is_debug: bool = False, **kwargs):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(_Console, cls).__new__(cls)
-                cls._instance.verbose = verbose
-                cls._instance.is_debug = is_debug
-                cls._instance.__init__(*args, **kwargs)
-            return cls._instance
+    default_sttings = {
+        "theme": Theme(
+            {
+                "config.name": "bold blue",  # Config class names
+                "config.field": "green",  # Regular fields
+                "config.propagated": "yellow",  # Propagated fields
+                "config.value": "white",  # Field values
+                "config.type": "dim",  # Type annotations
+                "config.doc": "italic dim",  # Documentation
+            }
+        ),
+        "width": 120,
+        "force_terminal": True,
+        "color_system": "auto",
+        "markup": True,
+        "highlight": True,
+    }
 
-    def __init__(self, *args, **kwargs):
-        if not hasattr(self, "_initialized"):
-            kwargs["force_terminal"] = True
-            kwargs["color_system"] = "auto"
-            kwargs["markup"] = True  # Ensure markup is enabled
-            kwargs["highlight"] = True  # Enable syntax highlighting
-            super().__init__(*args, **kwargs)
-            self._initialized = True
-            self.is_debug = kwargs.get("is_debug", False)
-            self.show_timestamps = kwargs.get("show_timestamps", False)
+    def __init__(self, **kwargs):
+        settings = self.default_sttings.copy()
+        settings.update(kwargs)
+        super().__init__(**settings)
+        self.is_debug = False
+        self.verbose = True
+        self.show_timestamps = False
+        self.prefix = None
+
+    @classmethod
+    def with_prefix(cls, *parts: str) -> "Console":
+        """
+        Create a new Console instance with a custom prefix for all log messages.
+        Enables builder-style chaining.
+
+        Usage:
+        ```python
+        console = Console.with_prefix(
+            self.__class__.__name__,
+            <name_of_the_current_method>
+            <further_parts>, # eg. stage, worker_idx...
+        )
+        ```
+        """
+        instance = cls()
+        instance.set_prefix(*parts)
+        return instance
+
+    def set_prefix(self, *parts: str) -> "Console":
+        """
+        Set a custom prefix for all log messages (e.g., class name + stage).
+        Enables builder-style chaining.
+        """
+        if not parts:
+            self.prefix = None
+        else:
+            self.prefix = "[/bold cyan][grey]::[/grey][bold cyan]".join(
+                filter(None, parts)
+            )
+
+        return self
+
+    def unset_prefix(self) -> "Console":
+        """Unset the prefix for all log messages."""
+        self.prefix = None
+        return self
+
+    def log(self, message: str) -> None:
+        if self.verbose:
+            self.print(self._format_message(message))
+
+    def warn(self, message: str) -> None:
+        if self.verbose:
+            self.print(
+                f"[bright_yellow]Warning:[/bright_yellow] {self._format_message(message)}\n"
+                f"[dim]{self._get_caller_stack()}[/dim]"
+            )
+
+    def error(self, message: str) -> None:
+        self.print(
+            f"[bright_red]Error:[/bright_red] {self._format_message(message)}\n"
+            f"[dim]{self._get_caller_stack()}[/dim]"
+        )
+
+    def plog(self, obj: Any, **kwargs) -> None:
+        """Pretty print an object using rich."""
+        if self.verbose:
+            self.print(pformat(obj, **kwargs))
+
+    def dbg(self, message: str) -> None:
+        if self.is_debug:
+            self.print(
+                f"[bold magenta]Debug:[/bold magenta] {self._format_message(message)}"
+            )
+
+    def set_verbose(self, verbose: bool) -> "Console":
+        self.verbose = verbose
+        return self
+
+    def set_debug(self, is_debug: bool) -> "Console":
+        self.is_debug = is_debug
+        self.is_verbose = self.verbose or is_debug
+        return self
+
+    def set_timestamp_display(self, show_timestamps: bool) -> "Console":
+        self.show_timestamps = show_timestamps
+        return self
+
+    def _format_message(self, message: str) -> str:
+        """Format message with optional timestamp and prefix."""
+        prefix = f"\[[bold cyan]{self.prefix}[/bold cyan]]: " if self.prefix else ""
+        if self.show_timestamps:
+            return f"[{self._get_timestamp()}] {prefix}{message}"
+        return f"{prefix}{message}"
 
     def _get_caller_stack(self) -> str:
         """Get formatted stack trace excluding Console internals"""
@@ -64,83 +157,6 @@ class _Console(RichConsole):
             traceback.format_list(relevant_frames[-2:])
         )  # Show last 2 relevant frames
 
-    def _get_timestamp(self) -> str:
-        """Get current timestamp in a readable format."""
-        return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
-    def _format_message(self, message: str) -> str:
-        """Format message with timestamp if enabled."""
-        if self.show_timestamps:
-            return f"[{self._get_timestamp()}] {message}"
-        return message
-
-    def warn(self, message: str) -> None:
-        if self.verbose:
-            stack_trace = self._get_caller_stack()
-            message = self._format_message(message)
-            self.print(
-                f"[bright_yellow]Warning:[/bright_yellow] {message}\n"
-                f"[dim]{stack_trace}[/dim]"
-            )
-
-    def error(self, message: str) -> None:
-        stack_trace = self._get_caller_stack()
-        message = self._format_message(message)
-        self.print(
-            f"[bright_red]Error:[/bright_red] {message}\n" f"[dim]{stack_trace}[/dim]"
-        )
-
-    def log(self, message: str) -> None:
-        if self.verbose:
-            message = self._format_message(message)
-            self.print(message)
-
-    def plog(self, obj: Any, **kwargs) -> None:
-        """Pretty print an object using rich."""
-        if self.is_debug:
-            self.print(pformat(obj, **kwargs))
-
-    def dbg(self, message: str) -> None:
-        """Print debug messages if in debug mode."""
-        if self.is_debug:
-            message = self._format_message(message)
-            self.print(f"[bold magenta]Debug:[/bold magenta] {message}")
-
-    def set_verbose(self, verbose: bool) -> None:
-        """Set verbosity level."""
-        self.verbose = verbose
-
-    def set_debug(self, is_debug: bool) -> None:
-        """Set debug mode."""
-        self.is_debug = is_debug
-        self.is_verbose = self.verbose or is_debug
-
-    def set_timestamp_display(self, show_timestamps: bool) -> None:
-        """Set whether to display timestamps in log messages."""
-        self.show_timestamps = show_timestamps
-
-
-CONFIG_THEME = Theme(
-    {
-        "config.name": "bold blue",  # Config class names
-        "config.field": "green",  # Regular fields
-        "config.propagated": "yellow",  # Propagated fields
-        "config.value": "white",  # Field values
-        "config.type": "dim",  # Type annotations
-        "config.doc": "italic dim",  # Documentation
-    }
-)
-
-CONSOLE = _Console(
-    width=120,
-    verbose=True,
-    force_terminal=True,
-    color_system="auto",
-    markup=True,
-    highlight=True,
-    theme=CONFIG_THEME,
-)
-
 
 TargetType = TypeVar("TargetType")
 
@@ -148,9 +164,6 @@ TargetType = TypeVar("TargetType")
 class NoTarget:
     @staticmethod
     def setup_target(config: "BaseConfig", **kwargs: Any) -> None:
-        CONSOLE.warn(
-            f"No target specified for config '{config.__class__.__name__}'. Returning None!"
-        )
         return None
 
 
@@ -184,7 +197,7 @@ class BaseConfig(BaseModel, Generic[TargetType]):
 
     def setup_target(self, **kwargs: Any) -> TargetType:
         if not callable(factory := getattr(self.target, "setup_target", self.target)):
-            CONSOLE.print(
+            Console().print(
                 f"Target '[bold yellow]{self.target}[/bold yellow]' of type [bold yellow]{factory.__class__.__name__}[/bold yellow] is not callable."
             )
             raise ValueError(
@@ -201,7 +214,7 @@ class BaseConfig(BaseModel, Generic[TargetType]):
             show_docs: Whether to show field descriptions and docstrings
         """
         tree = self._build_tree(show_docs=show_docs)
-        CONSOLE.print(tree, soft_wrap=False, highlight=True, markup=True, emoji=False)
+        Console().print(tree, soft_wrap=False, highlight=True, markup=True, emoji=False)
 
     def _build_tree(self, show_docs: bool = False) -> Tree:
         """Build rich Tree representation of config."""
@@ -333,7 +346,7 @@ class BaseConfig(BaseModel, Generic[TargetType]):
                 setattr(child_config, name, value)
                 child_config.propagated_fields[name] = value
 
-                CONSOLE.log(
+                Console().log(
                     f"Propagated {name}={value} from "
                     f"{self.__class__.__name__} to {child_config.__class__.__name__}"
                 )
@@ -366,7 +379,7 @@ class SingletonConfig(BaseConfig):
                 if hasattr(self, key):
                     current = getattr(self, key)
                     if current != value:
-                        CONSOLE.warn(
+                        Console().warn(
                             f"Updating singleton {self.__class__.__name__} "
                             f"field '{key}' from {current} to {value}"
                         )

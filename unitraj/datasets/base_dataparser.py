@@ -1,19 +1,17 @@
-# myproject/parsing/parser.py
-
-import pickle
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from multiprocessing import Pool
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import h5py
 import numpy as np
+import pandas as pd
 from metadrive.scenario import utils as sd_utils
-from scenarionet.common_utils import read_scenario
-from tqdm.auto import tqdm
+from typing_extensions import Self
 
 from ..configs.path_config import PathConfig
-from ..utils.base_config import CONSOLE
+from ..utils.base_config import Console
 from .common_utils import is_ddp
 from .types import (
     DatasetItem,
@@ -27,70 +25,73 @@ if TYPE_CHECKING:
     from .dataparser import DataParserConfig
 
 
-class BaseDataParser(ABC):
-    """
-    Splits raw ScenarioNet summaries into shards and runs
-    BaseDataset.process_data_chunk in parallel to build cache.
-    """
+def process_data_chunk_wrapper(
+    worker_idx: int,
+    config: "DataParserConfig",
+    starting_frame: int,
+    data_root: Path,
+    mapping: Dict[Any, str],
+    ids: List[str],
+) -> Dict[Stage, Dict[str, Dict[str, Any]]]:
+    # Initialize parser once per task and delegate work
+    parser = config.setup_target()
+    parser.starting_frame = starting_frame
+    return parser.process_data_chunk(worker_idx, data_root, mapping, ids)
 
+
+class BaseDataParser(ABC):
     def __init__(self, config: "DataParserConfig"):
         self.config = config
-        self.paths = PathConfig(root=config.cache_root)
+        self.paths: PathConfig = config.paths
 
-    def initialize_progress_bars(self, data_lists):
+        # Will hold pandas DataFrame of sample metadata for current split
+        self.sample_metadata: Optional[pd.DataFrame] = None
+
+    def load_data(self) -> Self:
         """
-        Initialize multiple progress bars for parallel processing.
-        Creates one progress bar for each worker to track their individual progress.
-
-        Args:
-            data_lists (List[List[str]]): Split data lists for each worker
-
-        Returns:
-            Dict[int, tqdm]: Dictionary mapping worker indices to their progress bars
+        Build a full index, split by Argo2 train/val/test, persist each,
+        then keep only the configured stage.
         """
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__, "load_data", self.config.stage.name
+        )
 
-        progress_bars = {}
-        for worker_idx, data_list in enumerate(data_lists):
-            desc = f"Worker {worker_idx}"
-            position = worker_idx  # Stack bars vertically by position
-            progress_bars[worker_idx] = tqdm(
-                total=len(data_list),
-                desc=desc,
-                position=position,
-                leave=True,
-                unit="scenario",
-                miniters=1,
-                dynamic_ncols=True,
-                colour="green" if worker_idx % 2 == 0 else "blue",  # Alternate colors
-            )
+        if not self.config.rebuild_dataset:
+            df = self.get_sample_metadata()
+            if not df.empty:
+                self.sample_metadata = df
+                CONSOLE.log(
+                    f"Metadata found for {self.config.stage}, skipping rebuild."
+                )
+        else:
+            # Build the full merged index (all splits)
+            self._build_full_index()
 
-        # Store as instance attribute to access in other methods
-        self._shared_progress_bars = progress_bars
-        return progress_bars
+            # Load the data for the current stage
+            self.sample_metadata = self.get_sample_metadata()
+            if self.sample_metadata.empty:
+                raise RuntimeError(
+                    f"No data files found for {self.config.stage} in {self.paths.dataset_dest_dir}"
+                )
 
-    def build_cache(self) -> Dict[str, Dict[str, Any]]:
+        return self
+
+    def _build_full_index(self) -> None:
         """
-        For each raw_data_dir:
-          - read its summary (ids → files)
-          - optionally sample debug subset
-          - split IDs across workers
-          - spawn process_data_chunk
-          - collect and merge all file_list dicts
-        Returns final merged file_list.
+        Scan every ScenarioNet folder, parallel-map into HDF5 shards,
+        and collect a merged mini-index of all records.
         """
-        merged: Dict[str, Dict[str, Any]] = {}
-        for raw_dir in self.config.raw_data_dirs:
-            split_name = raw_dir.name
-            CONSOLE.log(f"scanning {raw_dir}")
-            # 1) read summary
-            try:
-                meta_map, id_list, id_to_file = sd_utils.read_dataset_summary(raw_dir)
-            except Exception as e:
-                raise RuntimeError(f"Failed summary read of {raw_dir}: {e}")
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__, "_build_full_index", self.config.stage.name
+        )
+        for sn_idx, raw_dir in enumerate(self.paths.scenarionet_dirs):
+            self.starting_frame = self.config.starting_frame[sn_idx]
+            CONSOLE.log(f"Scanning {raw_dir.name}…")
+            _, id_list, id_to_file = sd_utils.read_dataset_summary(raw_dir)
 
-            # 2) debug sampling
-            if self.config.is_debug:
-                np.random.seed(0)
+            # debug sampling
+            if self.config.num_debug_samples is not None:
+                CONSOLE.log(f"Limiting to {self.config.num_debug_samples} samples.")
                 id_list = list(
                     np.random.choice(
                         id_list,
@@ -98,343 +99,172 @@ class BaseDataParser(ABC):
                         replace=False,
                     )
                 )
-                CONSOLE.log(f"debug-sampling {len(id_list)} of {len(id_list)}")
 
-            # 3) split into shards
-            n_workers = 1 if self.config.is_debug else self.config.get_num_workers()
-            splits = np.array_split(id_list, n_workers)
+            # configure number of workers & split into shards
+            num_workers = 1 if self.config.is_debug else self.config.get_num_workers()
+            np.random.shuffle(id_list)
+            id_shards = np.array_split(id_list, num_workers)
+
+            # prepare tasks: each tuple carries its shard index
             args = [
-                (str(raw_dir), id_to_file, list(s), split_name, self.config.stage, i)
-                for i, s in enumerate(splits)
+                (
+                    worker_idx,
+                    self.config,
+                    self.starting_frame,
+                    raw_dir,
+                    id_to_file,
+                    list(id_chunk),
+                )
+                for worker_idx, id_chunk in enumerate(id_shards)
             ]
 
-            # Initialize progress bars for all workers
-            if self.config.has_tqdm:
-                self.initialize_progress_bars([list(s) for s in splits])
-
-            # 4) dispatch
             if self.config.is_debug:
-                results = [self.process_data_chunk(self, *a) for a in args]
+                # serial execution
+                for idx, _, _, data_root, mapping, ids in args:
+                    sample_metadata = self.process_data_chunk(
+                        idx, data_root, mapping, ids
+                    )
+
             else:
-                with Pool(n_workers) as pool:
-                    results = pool.starmap(self.process_data_chunk, args)
-
-            # 5) collect
-            for r in results:
-                if r:
-                    merged.update(r)
-
-        # 6) persist the merged index for fast reload
-        idx_file = self.paths.cache / f"file_list_{self.config.stage}.pkl"
-        with idx_file.open("wb") as f:
-            pickle.dump(merged, f)
-        CONSOLE.log(f"wrote index {len(merged)} entries → {idx_file}")
-        return merged
-
-    def load_data(self):
-        """
-        Load or rebuild the cached file_list for each dataset split.
-        In debug mode → single-threaded rebuild + truncate overall to num_debug_samples.
-        """
-        self.data_loaded = {}
-        cfg = self.config
-        CONSOLE.log(
-            f"{self.config.stage} data loading started "
-            f"(use_cache={cfg.use_cache}, overwrite_cache={cfg.overwrite_cache}, "
-            f"debug={cfg.is_debug}, workers={cfg.load_num_workers})"
-        )
-
-        # Normalize and sanity‐check data paths
-        data_paths = (
-            cfg.paths.data if isinstance(cfg.paths.data, list) else [cfg.paths.data]
-        )
-        if not data_paths:
-            raise RuntimeError("No `paths.data` configured → cannot load any datasets")
-        for p in data_paths:
-            if not isinstance(p, Path) or not p.exists():
-                raise RuntimeError(f"Data path invalid or missing: {p}")
-
-        # Decide once whether to rebuild at all or attempt to load cache
-        do_rebuild = cfg.is_debug or not cfg.use_cache
-
-        total_loaded = 0
-        for idx, dp in enumerate(data_paths):
-            phase, name = dp.parent.name, dp.name
-            cache_dir = self.paths.get_cache_path(name, phase)
-            cache_file = cache_dir / f"{name}_{phase.lower()}.pkl"
-            if not cache_file.exists():
                 CONSOLE.log(
-                    f"({name}::{self.config.stage}) cache file not found, will rebuild: {cache_file}"
-                )
-                do_rebuild = True
-
-            data_usage = cfg.max_data_num[idx] if idx < len(cfg.max_data_num) else None
-            self.starting_frame = (
-                cfg.starting_frame[idx] if idx < len(cfg.starting_frame) else 0
-            )
-
-            CONSOLE.log(f"({name}::{self.config}) Path to ScenarioNet dir = {dp}")
-
-            CONSOLE.log(
-                f"({name}::{self.config}) {'will attempt to load' if not do_rebuild else 'will rebuild'} cache from {cache_dir}"
-            )
-
-            file_list: Dict[str, Any] = {}
-            if not do_rebuild and not cfg.overwrite_cache or is_ddp():
-                # 1) Try loading from cache
-                CONSOLE.log(f"({name}::{self.config}) → loading from cache")
-                try:
-                    file_list = self.get_data_list(name, phase, data_usage)
-                except Exception as e:
-                    CONSOLE.error(f"({name}::{self.config}) cache load failed: {e}")
-                    CONSOLE.log(f"({name}::{self.config}) falling back to rebuild")
-                else:
-                    CONSOLE.log(
-                        f"({name}::{self.config}) cache hit → {len(file_list)} samples"
-                    )
-
-            if not file_list:
-                # 2) Rebuild cache
-                CONSOLE.log(f"({name}::{self.config}) → rebuilding cache")
-                # read summary
-                try:
-                    map_id_to_meta, scenario_ids_list, map_id_to_file = (
-                        sd_utils.read_dataset_summary(dp)
-                    )
-                    num_scenarios_total = len(scenario_ids_list)
-                    if not scenario_ids_list:
-                        raise ValueError("no scenarios in summary")
-                except Exception as e:
-                    raise RuntimeError(
-                        f"({name}::{self.config}) summary read error: {e}"
-                    )
-                CONSOLE.log(
-                    f"({name}::{self.config}) found {len(scenario_ids_list)} scenarios"
+                    f"Processing a total of {len(id_list)} scenarios in {raw_dir.name} "
+                    f"with {num_workers} workers ({len(id_shards)} shards)…"
                 )
 
-                # select only num_debug_samples randomly selcted samples if in debug mode
-                if cfg.is_debug:
-                    max_dbg = cfg.num_debug_samples or num_scenarios_total
-                    n_dbg = min(max_dbg, num_scenarios_total)
-                    selected_ids = list(
-                        np.random.choice(scenario_ids_list, size=n_dbg, replace=False)
-                    )
-                    scenario_ids_list = selected_ids
-                    map_id_to_meta = {
-                        mid: meta
-                        for mid, meta in map_id_to_meta.items()
-                        if mid in selected_ids
-                    }
-                    map_id_to_file = {
-                        mid: fpath
-                        for mid, fpath in map_id_to_file.items()
-                        if mid in selected_ids
-                    }
-                    CONSOLE.log(
-                        f"({name}::{self.config}) debug mode: sampling {n_dbg} / {num_scenarios_total} scenarios"
-                    )
+                # dispatch shards and collect per-shard sample_metadata dicts
+                with Pool(num_workers) as p:
+                    results = p.starmap(process_data_chunk_wrapper, args)
+                # merge all shards' sample_metadata into per-split index
 
-                # prepare cache dir
-                self.paths.remove_dir(cache_dir)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-
-                # split and process
-                splits = np.array_split(scenario_ids_list, cfg.load_num_workers)
-
-                # 2) build list of direct args (passing worker_index in place of filename stem)
-                args: List[Tuple[str, Dict, List[str], str, str, int]] = [
-                    (str(dp), map_id_to_file, list(chunk), name, phase, i)
-                    for i, chunk in enumerate(splits)
-                ]
-
-                # 3) dispatch
-                if cfg.is_debug:
-                    results = [
-                        self.process_data_chunk(dp, mapping, chunk, name, phase, wid)
-                        for dp, mapping, chunk, name, phase, wid in args
-                    ]
-                else:
-                    CONSOLE.log(
-                        f"({name}::{self.config}) spawning {cfg.load_num_workers} worker(s)"
-                    )
-                    try:
-                        with Pool(cfg.load_num_workers) as pool:
-                            results = pool.starmap(self.process_data_chunk, args)
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"({name}::{self.config}) multiprocessing failed: {e}"
-                        )
-
-                # collect
-                for r in results:
-                    if r:
-                        file_list.update(r)
-                if not file_list:
-                    raise RuntimeError(
-                        f"({name}::{self.config}) rebuild produced 0 samples"
-                    )
-
-                # write cache
-                with cache_file.open("wb") as f:
-                    pickle.dump(file_list, f)
-                CONSOLE.log(
-                    f"({name}::{self.config}) rebuild complete → {len(file_list)} samples"
+                sample_metadata: Dict[Stage, Dict[str, Dict[str, Any]]] = defaultdict(
+                    dict
                 )
+                for part in results:
+                    for split, info in part.items():
+                        sample_metadata[split].update(info)
 
-                # apply per-split data_usage
-                if not self.self.config and data_usage:
-                    items = list(file_list.items())
-                    np.random.shuffle(items)
-                    file_list = dict(items[:data_usage])
-                    CONSOLE.log(
-                        f"({name}::{self.config}) applied data_usage={data_usage} → {len(file_list)} samples"
-                    )
-
-            # accumulate
-            self.data_loaded.update(file_list)
-            total_loaded += len(file_list)
-            CONSOLE.log(
-                f"({name}::{self.config}) accumulated → {total_loaded} total samples so far"
-            )
-
-        # TODO: improve naming of var "all_keys" and "self.data_loaded_keys"
-
-        # wrap up
-        all_keys = list(self.data_loaded)
-        CONSOLE.log(
-            f"\n{self.config} data loading finished → total {total_loaded} samples"
-        )
-
-        self.data_loaded_keys = all_keys
-
-        if total_loaded == 0:
-            raise RuntimeError(
-                f"{self.config} loaded 0 samples → please verify `paths.data` and cache settings"
-            )
+            # write pandas DataFrame per split
+            for split, info in sample_metadata.items():
+                df = pd.DataFrame.from_dict(info, orient="index")
+                df.to_pickle(self.paths.get_sample_metadata_path(split))
 
     def process_data_chunk(
         self,
-        data_path_str: str,
-        mapping: Dict[Any, Any],
-        data_list: List[str],
-        dataset_name: str,
-        phase: str,
-        worker_index: int,
-    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        worker_idx: int,
+        data_root: Path,
+        mapping: Dict[Any, str],
+        ids: List[str],
+    ) -> Dict[Stage, Dict[str, Dict[str, Any]]]:
         """
-        Process a chunk of scenarios in parallel, writing them to an HDF5 shard
-        and returning a map of group_name → file_info (including kalman_difficulty).
-
-        Args:
-            data_path_str (str): Path to the scenario data.
-            mapping (Dict[Any, Any]): Mapping of scenario IDs to file names.
-            data_list (List[str]): List of scenario file names to process.
-            dataset_name (str): Name of the dataset.
-            phase (str): Phase of the dataset (e.g., "train", "val").
-            worker_index (int): Index of the worker processing this chunk.
-
-        Returns:
-            A dict mapping each HDF5 group name to its file info, or None on error.
+        Worker function:
+          - reads each scenario via `read_scenario`
+          - assigns it to its Argo2 split
+          - runs preprocess/process/postprocess
+          - returns a mini-index dict with all records info
         """
-        progress_bar = getattr(self, "_shared_progress_bars", {}).get(worker_index)
-
-        # Prepare output container
-        file_list: Dict[str, Dict[str, Any]] = {}
-
-        # Determine HDF5 shard path via PathConfig
-        hdf5_path: Path = self.paths.get_cache_chunk_path(
-            dataset_name, phase, worker_index
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__,
+            "process_data_chunk",
+            self.config.stage.name,
+            f"worker_{worker_idx}",
         )
-        h5f = h5py.File(hdf5_path, "w")
 
-        # --- Create / open HDF5 file and write each scenario's outputs ---
-        try:
-            n = len(data_list)
-            for cnt, file_name in enumerate(data_list):
-                if worker_index == 0 and cnt and cnt % max(n // 10, 1) == 0:
-                    CONSOLE.log(f"[{dataset_name}/{phase}] Worker0 processed {cnt}/{n}")
+        # {Split: {extended_sid: {h5_path: <path>, kalman_difficulty: np.ndarray}}}
+        sample_metadata: Dict[Stage, Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
-                # Update progress bar if available
-                if progress_bar is not None:
-                    progress_bar.set_description(f"Worker {worker_index}")
-                    progress_bar.update(1)
-                # Log progress every 10%
-                if worker_index == 0 and cnt and cnt % max(n // 10, 1) == 0:
-                    CONSOLE.log(
-                        f"[{dataset_name}/{phase}] Worker 0: processed {cnt}/{n}"
-                    )
+        orig_ds_name = data_root.name
+        hdf5_path = (
+            self.paths.dataset_dest_dir / f"{orig_ds_name}_worker_{worker_idx}.h5"
+        )
 
-                # Read the raw scenario
+        with h5py.File(hdf5_path, "w") as hdf5_file:
+            for id_cnt, sid in enumerate(ids):
+                # --- read raw scenario ---
                 try:
-                    scenario = read_scenario(data_path_str, mapping, file_name)
-                    scenario.setdefault("metadata", {})[
-                        "dataset"
-                    ] = f"{dataset_name}/{phase}"
+                    scen_pth = data_root / mapping[sid] / sid
+                    scen = sd_utils.read_scenario_data(scen_pth)
                 except Exception as e:
-                    CONSOLE.warn(
-                        f"[read_scenario] {dataset_name}/{phase}/{file_name}: {e}"
-                    )
+                    CONSOLE.warn(f"[read_scenario] {sid}: {e}")
                     continue
 
-                # Pipeline: preprocess → process → postprocess
+                # --- determine AV2 split ---
+                if orig_ds_name == "av2_scenarionet":
+                    sid_str = sid.replace("sd_av2_v2_", "").replace(".pkl", "")
+                    split = self.paths.find_av2_split(sid_str) or Stage.TRAIN
+                else:
+                    raise NotImplementedError(
+                        f"Dataset {orig_ds_name} not supported for split detection."
+                    )
+
+                # --- pipeline ---
                 try:
-                    out = self.preprocess(scenario)
-                    assert out is not None, "preprocess returned None"
-                    out = self.process(out)
-                    assert out is not None, "process returned None"
+                    pre_out = self.preprocess(scen)
+                    assert pre_out is not None, f"preprocess() yielded None for {sid}"
+                    out = self.process(pre_out)
+                    assert out is not None, f"process() yielded None for {sid}"
                     out = self.postprocess(out)
-                    assert out is not None, "postprocess returned None"
-
+                    assert out is not None, f"postprocess() yielded None for {sid}"
                 except Exception as e:
-                    CONSOLE.warn(f"[pipeline] {dataset_name}/{phase}/{file_name}: {e}")
+                    CONSOLE.warn(f"[pipeline] {sid}: {e}")
                     continue
 
-                # Write each record in this scenario to HDF5
-                for i, record in enumerate(out):
-                    grp_name = f"{dataset_name}-{worker_index}-{cnt}-{i}"
-                    grp = h5f.create_group(grp_name)
+                # stack kalman difficulty once for this scenario
+                kd_arr = np.stack(
+                    [item.model_dump()["kalman_difficulty"] for item in out]
+                )
+                num_agents_interest = len(out)
+                for agent_idx, agent_record in enumerate(out):
+                    grp_name = f"{orig_ds_name}-{worker_idx}-{id_cnt}-{agent_idx}"
+                    grp = hdf5_file.create_group(grp_name)
+                    for key, value in agent_record.model_dump().items():
+                        if isinstance(value, str):
+                            value = np.bytes_(value)
+                        grp.create_dataset(key, data=value)
+                    # accumulate metadata without resetting
 
-                    # Convert DatasetItem to dict (using field values, not model internals)
-                    record_dict = record.model_dump()
-
-                    # Write each field to the HDF5 group
-                    for key, value in record_dict.items():
-                        try:
-                            # Handle string conversion explicitly
-                            if isinstance(value, str):
-                                value = np.bytes_(value)
-                            # Attempt to create dataset
-                            grp.create_dataset(key, data=value)
-                        except TypeError as te:
-                            CONSOLE.warn(
-                                f"HDF5 TypeError for key '{key}' in group '{grp_name}': {te}. Skipping key."
-                            )
-
-                    file_info = {
-                        # Get kalman_difficulty from the first record (all records in a scenario should have the same value)
-                        "kalman_difficulty": (
-                            record.kalman_difficulty
-                            if record.kalman_difficulty is not None
-                            else np.array([0.0])
+                    meta = {
+                        "h5_path": hdf5_path,
+                        "kalman_difficulty": kd_arr,
+                        "num_agents": np.sum(
+                            np.any(agent_record.obj_trajs_last_pos != 0, axis=1)
+                        ).item(),
+                        "num_agents_interest": num_agents_interest,
+                        "scenario_future_duration": int(
+                            agent_record.obj_trajs_future_mask.shape[1]
                         ),
-                        "h5_path": str(hdf5_path),  # Store path as string
-                        "h5_group": grp_name,  # Store the group name for easier lookup
+                        "num_map_polylines": int(agent_record.map_polylines.shape[0]),
+                        "track_index_to_predict": int(
+                            agent_record.track_index_to_predict
+                        ),
+                        "center_objects_type": int(agent_record.center_objects_type),
+                        "dataset_name": agent_record.dataset_name,
+                        "trajectory_type": (
+                            int(agent_record.trajectory_type)
+                            if agent_record.trajectory_type is not None
+                            else None
+                        ),
                     }
-                    file_list[grp_name] = file_info  # Use group name as the key
+                    sample_metadata[split][grp_name] = meta
 
-                del scenario, out
+                del out
+                del scen
 
+        return sample_metadata
+
+    def get_sample_metadata(self, split: Optional[Stage] = None) -> pd.DataFrame:
+        """
+        Load the sample metadata DataFrame for the given split.
+        """
+        split = split or self.config.stage
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__, "get_sample_metadata", split.name
+        )
+        idx_path = self.paths.get_sample_metadata_path(split)
+        try:
+            return pd.read_pickle(idx_path)
         except Exception as e:
-            CONSOLE.error(
-                f"[worker {worker_index}] HDF5 write error at {hdf5_path}: {e}"
-            )
-            return None
-        finally:
-            h5f.close()
-            if progress_bar is not None:
-                progress_bar.close()
-
-        return file_list
+            CONSOLE.error(f"Failed to load sample metadata DataFrame: {idx_path}: {e}")
+            return pd.DataFrame()
 
     @abstractmethod
     def preprocess(self, scenario: RawScenarioDict) -> Optional[ProcessedDataDict]:
