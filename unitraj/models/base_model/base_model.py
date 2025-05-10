@@ -1,4 +1,6 @@
 import json
+import os
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pytorch_lightning as pl
@@ -6,20 +8,55 @@ import torch
 import unitraj.datasets.common_utils as common_utils
 import unitraj.utils.visualization as visualization
 import wandb
+from pytorch_lightning.loggers import WandbLogger
+
+from ...datasets.types import BatchDict
 
 
 class BaseModel(pl.LightningModule):
+    """
+    Base model for trajectory prediction models.
 
-    def __init__(self, config):
+    This class implements the common functionality for trajectory prediction models,
+    including evaluation metrics computation, logging, and visualization.
+
+    Derived classes must implement:
+    - forward: Model inference
+    - configure_optimizers: Optimizer configuration
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the base model.
+
+        Args:
+            config: Configuration dictionary for the model.
+        """
         super().__init__()
         self.config = config
+        self.save_hyperparameters(config)
+        self.pred_dicts: List[Dict[str, Any]] = []
 
-        self.pred_dicts = []
+        # Initialize tracking of best metrics
+        self._best_metrics: Dict[str, float] = {
+            "val/minADE6": float("inf"),
+            "val/minFDE6": float("inf"),
+            "val/brier_fde": float("inf"),
+        }
+
+        # WandB logger setup check
+        self._wandb_ready: bool = False
 
         if config.get("eval_nuscenes", False):
             self.init_nuscenes()
 
-    def init_nuscenes(self):
+    def init_nuscenes(self) -> None:
+        """
+        Initialize the NuScenes dataset evaluation components if required.
+
+        This method imports and initializes NuScenes related components that are
+        needed for evaluation when using the NuScenes dataset.
+        """
         if self.config.get("eval_nuscenes", False):
             from nuscenes import NuScenes
             from nuscenes.eval.prediction.config import PredictionConfig
@@ -36,30 +73,57 @@ class BaseModel(pl.LightningModule):
                 pred_config = json.load(f)
             self.pred_config5 = PredictionConfig.deserialize(pred_config, self.helper)
 
-    def forward(self, batch):
+    def forward(self, batch: BatchDict) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
-        Forward pass for the model
-        :param batch: input batch
-        :return: prediction: {
-                'predicted_probability': (batch_size,modes)),
-                'predicted_trajectory': (batch_size,modes, future_len, 2)
-                }
-                loss (with gradient)
+        Forward pass for the model. Should be implemented by derived classes.
+
+        Args:
+            batch: Input batch containing trajectory data and metadata.
+
+        Returns:
+            Tuple containing:
+                - prediction: Dictionary with keys:
+                  - 'predicted_probability': Probabilities for each trajectory mode (batch_size, modes)
+                  - 'predicted_trajectory': Predicted trajectories (batch_size, modes, future_len, 2)
+                - loss: Loss tensor with gradient
         """
         raise NotImplementedError
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch: BatchDict, batch_idx: int) -> torch.Tensor:
+        """
+        Perform a training step.
+
+        Args:
+            batch: Input batch containing trajectory data and metadata.
+            batch_idx: Index of the current batch.
+
+        Returns:
+            Loss tensor for backpropagation.
+        """
         prediction, loss = self.forward(batch)
         self.log_info(batch, batch_idx, prediction, status="train")
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch: BatchDict, batch_idx: int) -> torch.Tensor:
+        """
+        Perform a validation step.
+
+        Args:
+            batch: Input batch containing trajectory data and metadata.
+            batch_idx: Index of the current batch.
+
+        Returns:
+            Loss tensor (not used for backpropagation).
+        """
         prediction, loss = self.forward(batch)
         self.compute_official_evaluation(batch, prediction)
         self.log_info(batch, batch_idx, prediction, status="val")
         return loss
 
-    def on_validation_epoch_end(self):
+    def on_validation_epoch_end(self) -> None:
+        """Log metrics at the end of each validation epoch."""
+        metric_results = None
+
         if self.config.get("eval_waymo", False):
             metric_results, result_format_str = self.compute_metrics_waymo(
                 self.pred_dicts
@@ -67,8 +131,11 @@ class BaseModel(pl.LightningModule):
             print(metric_results)
             print(result_format_str)
 
+            # Log metrics to wandb
+            if hasattr(self, "logger") and self.logger is not None:
+                self._log_metrics_to_wandb("val/waymo", metric_results)
+
         elif self.config.get("eval_nuscenes", False):
-            import os
 
             os.makedirs("submission", exist_ok=True)
             json.dump(
@@ -78,10 +145,73 @@ class BaseModel(pl.LightningModule):
             metric_results = self.compute_metrics_nuscenes(self.pred_dicts)
             print("\n", metric_results)
 
+            # Log metrics to wandb
+            if hasattr(self, "logger") and self.logger is not None:
+                self._log_metrics_to_wandb("val/nuscenes", metric_results)
+
         elif self.config.get("eval_argoverse2", False):
             metric_results = self.compute_metrics_av2(self.pred_dicts)
 
+            # Log metrics to wandb (already being logged in compute_metrics_av2)
+
+        # Track best metrics and log improvement
+        self._update_best_metrics()
+
         self.pred_dicts = []
+
+    def _log_metrics_to_wandb(self, prefix: str, metrics: Dict[str, Any]) -> None:
+        """
+        Helper method to log metrics to wandb.
+
+        Args:
+            prefix: Prefix for the metric names (e.g., 'val/waymo')
+            metrics: Dictionary of metrics to log
+        """
+        if not isinstance(metrics, dict):
+            return
+
+        for key, value in metrics.items():
+            metric_name = f"{prefix}/{key}"
+            self.log(
+                metric_name,
+                value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+            )
+
+    def _update_best_metrics(self) -> None:
+        """
+        Track best metrics and log improvements.
+
+        This method checks if the current metrics are better than the best
+        recorded metrics, and updates the best metrics accordingly.
+        """
+        current_minADE = self.trainer.callback_metrics.get("val/minADE6", None)
+        current_minFDE = self.trainer.callback_metrics.get("val/minFDE6", None)
+        current_brier = self.trainer.callback_metrics.get("val/brier_fde", None)
+
+        if (
+            current_minADE is not None
+            and current_minADE < self._best_metrics["val/minADE6"]
+        ):
+            self._best_metrics["val/minADE6"] = current_minADE
+            self.log("val/best_minADE6", current_minADE, prog_bar=False, logger=True)
+
+        if (
+            current_minFDE is not None
+            and current_minFDE < self._best_metrics["val/minFDE6"]
+        ):
+            self._best_metrics["val/minFDE6"] = current_minFDE
+            self.log("val/best_minFDE6", current_minFDE, prog_bar=False, logger=True)
+
+        if (
+            current_brier is not None
+            and current_brier < self._best_metrics["val/brier_fde"]
+        ):
+            self._best_metrics["val/brier_fde"] = current_brier
+            self.log("val/best_brier_fde", current_brier, prog_bar=False, logger=True)
 
     def configure_optimizers(self):
         raise NotImplementedError
@@ -170,7 +300,7 @@ class BaseModel(pl.LightningModule):
         # print(metric_result_str)
         return metric_results
 
-    def compute_official_evaluation(self, batch_dict, prediction):
+    def compute_official_evaluation(self, batch_dict: BatchDict, prediction):
         if self.config.get("eval_waymo", False):
 
             input_dict = batch_dict["input_dict"]
@@ -301,13 +431,25 @@ class BaseModel(pl.LightningModule):
 
             self.pred_dicts += pred_dict_list
 
-    def log_info(self, batch, batch_idx, prediction, status="train"):
-        ## logging
+    def log_info(
+        self,
+        batch: BatchDict,
+        batch_idx: int,
+        prediction: Dict[str, torch.Tensor],
+        status: str = "train",
+    ) -> None:
+        """
+        Calculate and log metrics for the current batch.
+
+        Args:
+            batch: Input batch containing trajectory data and metadata
+            batch_idx: Index of the current batch
+            prediction: Dictionary containing model predictions
+            status: Current stage ('train' or 'val')
+        """
         # Split based on dataset
         inputs = batch["input_dict"]
-        gt_traj = inputs["center_gt_trajs"].unsqueeze(
-            1
-        )  # .transpose(0, 1).unsqueeze(0)
+        gt_traj = inputs["center_gt_trajs"].unsqueeze(1)
         gt_traj_mask = inputs["center_gt_trajs_mask"].unsqueeze(1)
         center_gt_final_valid_idx = inputs["center_gt_final_valid_idx"]
 
@@ -323,6 +465,7 @@ class BaseModel(pl.LightningModule):
         )
         ade_losses = ade_losses.cpu().detach().numpy()
         minade = np.min(ade_losses, axis=1)
+
         # Calculate FDE losses
         bs, modes, future_len = ade_diff.shape
         center_gt_final_valid_idx = (
@@ -366,7 +509,6 @@ class BaseModel(pl.LightningModule):
 
         # merge new_dict with log_dict
         loss_dict.update(new_dict)
-        # loss_dict.update(avg_dict)
 
         if status == "val" and self.config.get("eval", False):
 
@@ -434,19 +576,80 @@ class BaseModel(pl.LightningModule):
         size_dict = {key: len(value) for key, value in loss_dict.items()}
         loss_dict = {key: np.mean(value) for key, value in loss_dict.items()}
 
+        # Use self.log with explicit logger=True to ensure metrics get to wandb
         for k, v in loss_dict.items():
+            metric_name = f"{status}/{k}"
+
+            # Fix: Explicitly check for NaN values which can break wandb
+            if np.isnan(v):
+                continue
+
             self.log(
-                status + "/" + k,
-                v,
+                metric_name,
+                float(v),  # Ensure the value is a Python float
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=size_dict[k],
                 logger=True,
+                prog_bar=(k in ["minADE6", "minFDE6", "brier_fde"]),
             )
 
-        # if self.local_rank == 0 and status == 'val' and batch_idx == 0:
-        #     img = visualization.visualize_prediction(batch, prediction)
-        #     wandb.log({"prediction": [wandb.Image(img)]})
+        # Add visualization on validation
+        if (
+            status == "val"
+            and batch_idx == 0
+            and hasattr(self, "logger")
+            and isinstance(self.logger, WandbLogger)
+            and self.logger.experiment is not None
+        ):
+            try:
+                # Sample a few trajectories to visualize
+                img = visualization.visualize_prediction(batch, prediction)
+                # Log image to wandb
+                self.logger.experiment.log(
+                    {"prediction": [wandb.Image(img)], "global_step": self.global_step}
+                )
+            except Exception as e:
+                print(f"Warning: Failed to log visualization: {e}")
 
         return
+
+    def on_validation_batch_end(
+        self,
+        outputs: torch.Tensor,
+        batch: BatchDict,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        """
+        Log visualizations for a few batches during validation.
+
+        Args:
+            outputs: The outputs from the validation_step
+            batch: The input batch
+            batch_idx: The index of the current batch
+            dataloader_idx: The index of the dataloader
+        """
+        # Only log images for the first few batches to avoid too many images in wandb
+        if (
+            batch_idx < 3
+            and hasattr(self, "logger")
+            and isinstance(self.logger, WandbLogger)
+        ):
+            try:
+                # Generate the prediction for this batch
+                prediction, _ = self.forward(batch)
+
+                # Create visualization
+                img = visualization.visualize_prediction(batch, prediction)
+
+                # Log to wandb
+                self.logger.experiment.log(
+                    {
+                        f"predictions/batch_{batch_idx}": wandb.Image(img),
+                        "global_step": self.global_step,
+                    }
+                )
+            except Exception as e:
+                print(f"Error generating visualization: {e}")
