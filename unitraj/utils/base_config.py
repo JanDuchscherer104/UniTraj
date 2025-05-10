@@ -1,5 +1,3 @@
-import datetime
-import traceback
 from enum import Enum
 from pathlib import Path
 from threading import Lock
@@ -15,148 +13,12 @@ from typing import (
     TypeVar,
 )
 
-from devtools import pformat
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from rich.console import Console as RichConsole
 from rich.text import Text
-from rich.theme import Theme
 from rich.tree import Tree
 
-
-class Console(RichConsole):
-    # TODO: get prefix automatically from caller (via caller stack?)
-    is_debug: bool
-    prefix: Optional[str] = None
-
-    default_sttings = {
-        "theme": Theme(
-            {
-                "config.name": "bold blue",  # Config class names
-                "config.field": "green",  # Regular fields
-                "config.propagated": "yellow",  # Propagated fields
-                "config.value": "white",  # Field values
-                "config.type": "dim",  # Type annotations
-                "config.doc": "italic dim",  # Documentation
-            }
-        ),
-        "width": 120,
-        "force_terminal": True,
-        "color_system": "auto",
-        "markup": True,
-        "highlight": True,
-    }
-
-    def __init__(self, **kwargs):
-        settings = self.default_sttings.copy()
-        settings.update(kwargs)
-        super().__init__(**settings)
-        self.is_debug = False
-        self.verbose = True
-        self.show_timestamps = False
-        self.prefix = None
-
-    @classmethod
-    def with_prefix(cls, *parts: str) -> "Console":
-        """
-        Create a new Console instance with a custom prefix for all log messages.
-        Enables builder-style chaining.
-
-        Usage:
-        ```python
-        console = Console.with_prefix(
-            self.__class__.__name__,
-            <name_of_the_current_method>
-            <further_parts>, # eg. stage, worker_idx...
-        )
-        ```
-        """
-        instance = cls()
-        instance.set_prefix(*parts)
-        return instance
-
-    def set_prefix(self, *parts: str) -> "Console":
-        """
-        Set a custom prefix for all log messages (e.g., class name + stage).
-        Enables builder-style chaining.
-        """
-        if not parts:
-            self.prefix = None
-        else:
-            self.prefix = "[/bold cyan][grey]::[/grey][bold cyan]".join(
-                filter(None, parts)
-            )
-
-        return self
-
-    def unset_prefix(self) -> "Console":
-        """Unset the prefix for all log messages."""
-        self.prefix = None
-        return self
-
-    def log(self, message: str) -> None:
-        if self.verbose:
-            self.print(self._format_message(message))
-
-    def warn(self, message: str) -> None:
-        if self.verbose:
-            self.print(
-                f"[bright_yellow]Warning:[/bright_yellow] {self._format_message(message)}\n"
-                f"[dim]{self._get_caller_stack()}[/dim]"
-            )
-
-    def error(self, message: str) -> None:
-        self.print(
-            f"[bright_red]Error:[/bright_red] {self._format_message(message)}\n"
-            f"[dim]{self._get_caller_stack()}[/dim]"
-        )
-
-    def plog(self, obj: Any, **kwargs) -> None:
-        """Pretty print an object using rich."""
-        if self.verbose:
-            self.print(pformat(obj, **kwargs))
-
-    def dbg(self, message: str) -> None:
-        if self.is_debug:
-            self.print(
-                f"[bold magenta]Debug:[/bold magenta] {self._format_message(message)}"
-            )
-
-    def set_verbose(self, verbose: bool) -> "Console":
-        self.verbose = verbose
-        return self
-
-    def set_debug(self, is_debug: bool) -> "Console":
-        self.is_debug = is_debug
-        self.is_verbose = self.verbose or is_debug
-        return self
-
-    def set_timestamp_display(self, show_timestamps: bool) -> "Console":
-        self.show_timestamps = show_timestamps
-        return self
-
-    def _format_message(self, message: str) -> str:
-        """Format message with optional timestamp and prefix."""
-        prefix = f"\[[bold cyan]{self.prefix}[/bold cyan]]: " if self.prefix else ""
-        if self.show_timestamps:
-            return f"[{self._get_timestamp()}] {prefix}{message}"
-        return f"{prefix}{message}"
-
-    def _get_caller_stack(self) -> str:
-        """Get formatted stack trace excluding Console internals"""
-        stack = traceback.extract_stack()
-        # Filter out frames from this file
-        current_file = Path(__file__).resolve()
-        relevant_frames = [
-            frame
-            for frame in stack[:-1]  # Exclude current frame
-            if Path(frame.filename).resolve() != current_file
-        ]
-        # Format remaining frames
-        return "".join(
-            traceback.format_list(relevant_frames[-2:])
-        )  # Show last 2 relevant frames
-
+from .console import Console
 
 TargetType = TypeVar("TargetType")
 
@@ -169,7 +31,8 @@ class NoTarget:
 
 class BaseConfig(BaseModel, Generic[TargetType]):
     target: Callable[["BaseConfig[TargetType]"], TargetType] = Field(
-        default_factory=lambda: NoTarget
+        default_factory=lambda: NoTarget,
+        exclude=True,
     )
 
     model_config = ConfigDict(
@@ -194,6 +57,45 @@ class BaseConfig(BaseModel, Generic[TargetType]):
         data = OmegaConf.to_container(cfg, resolve=True)
         # feed into Pydantic constructor (will validate/convert types)
         return cls.model_validate(data, strict=False)  # type: ignore
+
+    @classmethod
+    def from_toml(cls, toml_path: Path) -> "BaseConfig":
+        """
+        Load a configuration from a TOML file into this BaseConfig.
+        """
+        try:
+            import tomllib  # type: ignore[import]
+        except ImportError:
+            import tomli as tomllib
+        with toml_path.open("rb") as f:
+            data = tomllib.load(f)
+        # validate and convert nested configs
+        return cls.model_validate(data, strict=False)
+
+    def to_toml(self, toml_path: Path, exclude_none: bool = True) -> None:
+        """
+        Dump this config to a TOML file, serializing only Pydantic fields.
+        """
+        try:
+            import toml
+        except ImportError:
+            raise RuntimeError("Install 'toml' package to use BaseConfig.to_toml()")
+        data = self.model_dump(exclude_none=exclude_none)
+        toml_str = toml.dumps(data)
+        path = Path(toml_path)
+        path.write_text(toml_str, encoding="utf-8")
+
+    def dump_toml(self, toml_path: Path):
+        try:
+            import tomllib  # type: ignore[import]
+        except ImportError:
+            import tomli_w as tomllib
+        try:
+            with toml_path.open("wb") as f:
+                tomllib.dump(self.model_dump(), f)
+        except Exception as e:
+            Console().error(f"Failed to write TOML file {toml_path}: {e}")
+            raise e
 
     def setup_target(self, **kwargs: Any) -> TargetType:
         if not callable(factory := getattr(self.target, "setup_target", self.target)):
@@ -311,22 +213,22 @@ class BaseConfig(BaseModel, Generic[TargetType]):
         except Exception:
             return "Any"
 
-    @model_validator(mode="after")
-    def _propagate_shared_fields(self) -> "BaseConfig":
-        """Propagate shared fields to nested BaseConfig instances"""
-        for field_name, field_value in self:
+    # @model_validator(mode="after")
+    # def _propagate_shared_fields(self) -> "BaseConfig":
+    #     """Propagate shared fields to nested BaseConfig instances"""
+    #     for field_name, field_value in self:
 
-            # If field is another BaseConfig
-            if isinstance(field_value, BaseConfig):
-                self._propagate_to_child(field_name, field_value)
+    #         # If field is another BaseConfig
+    #         if isinstance(field_value, BaseConfig):
+    #             self._propagate_to_child(field_name, field_value)
 
-            # Handle lists/tuples of BaseConfigs
-            elif isinstance(field_value, (list, tuple)):
-                for item in field_value:
-                    if isinstance(item, BaseConfig):
-                        self._propagate_to_child(field_name, item)
+    #         # Handle lists/tuples of BaseConfigs
+    #         elif isinstance(field_value, (list, tuple)):
+    #             for item in field_value:
+    #                 if isinstance(item, BaseConfig):
+    #                     self._propagate_to_child(field_name, item)
 
-        return self
+    #     return self
 
     def _propagate_to_child(
         self, parent_field: str, child_config: "BaseConfig"
