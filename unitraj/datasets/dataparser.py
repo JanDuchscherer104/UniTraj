@@ -1,20 +1,34 @@
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import numpy as np
-from pydantic import Field, field_validator
+from pydantic import Field
 
 from ..configs.path_config import PathConfig
-from ..datasets.common_utils import (find_true_segments, generate_mask,
-                                     get_polyline_dir, interpolate_polyline)
-from ..utils.base_config import BaseConfig, Console
+from ..datasets.common_utils import (
+    find_true_segments,
+    generate_mask,
+    get_polyline_dir,
+    interpolate_polyline,
+)
+from ..utils.base_config import BaseConfig
+from ..utils.console import Console
 from . import common_utils
 from .base_dataparser import BaseDataParser
-from .types import (BatchDict, DatasetItem, DynamicMapInfosDict,
-                    InternalFormatDict, MapInfosDict, MetaDriveType,
-                    ObjectType, PolylineType, ProcessedDataDict,
-                    RawScenarioDict, Stage, TrackInfosDict,
-                    TracksToPredictDict)
+from .types import (
+    DatasetItem,
+    DynamicMapInfosDict,
+    InternalFormatDict,
+    MapInfosDict,
+    MetaDriveType,
+    ObjectType,
+    PolylineType,
+    ProcessedDataDict,
+    RawScenarioDict,
+    Stage,
+    TrackInfosDict,
+    TracksToPredictDict,
+)
 
 
 class DataParserConfig(BaseConfig["DataParser"]):
@@ -151,7 +165,7 @@ class DataParserConfig(BaseConfig["DataParser"]):
 
     def setup_target(self, **kwargs) -> "DataParser":
         CONSOLE = Console.with_prefix(
-            self.__class__.__name__, "setup_target", str(self.stage)
+            self.__class__.__name__, "setup_target", self.stage.name
         )
 
         if self.is_debug:
