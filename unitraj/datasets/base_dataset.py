@@ -6,30 +6,16 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import h5py
 import hydra
 import numpy as np
-import pandas as pd
-import torch
 from metadrive.scenario.scenario_description import MetaDriveType
-from omegaconf import OmegaConf
-from PIL import Image
 from pydantic import BaseModel, Field, field_validator
 from torch.utils.data import Dataset
-from torch.utils.data._utils.collate import default_collate
 
 from ..configs.path_config import PathConfig
-from ..utils.base_config import BaseConfig, Console
+from ..utils.base_config import BaseConfig
+from ..utils.console import Console
 from ..utils.visualization import check_loaded_data
 from .dataparser import DataParserConfig
-from .types import BatchDict, DatasetItem, InternalFormatDict, ObjectType, Stage
-
-# TODO: use polars internally??
-# TODO: use pydantic objects instead of typed dicts
-# TODO: create DataModel(BaseModel) for the DataSet Item, they should have a useful __repr__ function
-# TODO: improve the splitting into train:val:test (using the original split as in argoverse2, and scenarioNet)
-# TODO: add plotting functions
-# TODO: split into Dataset and DataParser
-# TODO: improve naming of the variables
-# TODO: use unified logging style and system (LOGGER.set_prefix(self.__class__.__name__))
-# TODO: do not overwrite cache by default
+from .types import DatasetItem, Stage
 
 
 class DatasetConfig(BaseConfig["BaseDataset"]):
@@ -75,34 +61,6 @@ class BaseDataset(Dataset):
         # Reset index name to group name
         self.data_samples.index.name = "group_name"
 
-    def collate_fn(self, data_list: List[Optional[DatasetItem]]) -> Optional[BatchDict]:
-        """
-        Collates a list of DatasetItems into a BatchDict for model input.
-
-        Args:
-            data_list (List[Optional[DatasetItem]]): List of data items, potentially containing None values.
-
-        Returns:
-            Optional[BatchDict]: A dictionary containing batched tensors, or None if the batch is empty.
-        """
-        batch = list(filter(lambda x: x is not None, data_list))
-        if not batch:
-            return None
-
-        # stack arrays -> Tensors, leave other objects alone
-        input_dict = default_collate(batch)
-
-        cot = input_dict.get("center_objects_type")
-        if isinstance(cot, torch.Tensor):
-            input_dict["center_objects_type"] = cot.numpy()
-
-        batch_dict: BatchDict = {
-            "batch_size": len(batch),
-            "input_dict": input_dict,
-            "batch_sample_count": len(batch),
-        }
-        return batch_dict
-
     def __len__(self):
         return len(self.data_samples)
 
@@ -135,6 +93,15 @@ class BaseDataset(Dataset):
                 val = arr
             data[key] = val
         return DatasetItem(**data)
+
+    def close_files(self):
+        """
+        Close all open HDF5 files.
+        """
+        for h5_path in self.data_samples["h5_path"].unique():
+            h5f = self._get_file(h5_path)
+            if h5f:
+                h5f.close()
 
     # --- Unused/Debugging Methods ---
     def sample_from_distribution(self, original_array, m=100):
