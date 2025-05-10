@@ -480,6 +480,17 @@ class DatasetItem(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
 
+    def to_tensor_dict(self) -> Dict[str, Any]:
+        import torch
+
+        tdict = {}
+        for name, val in self.__dict__.items():
+            if isinstance(val, np.ndarray):
+                tdict[name] = torch.from_numpy(val)
+            else:
+                tdict[name] = val
+        return tdict
+
     def summary(self) -> str:
         sid = (
             self.scenario_id.decode("utf-8")
