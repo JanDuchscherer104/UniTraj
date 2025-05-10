@@ -8,10 +8,11 @@ import h5py
 import numpy as np
 import pandas as pd
 from metadrive.scenario import utils as sd_utils
+from networkx import dfs_edges
 from typing_extensions import Self
 
 from ..configs.path_config import PathConfig
-from ..utils.base_config import Console
+from ..utils.console import Console
 from .common_utils import is_ddp
 from .types import (
     DatasetItem,
@@ -40,11 +41,35 @@ def process_data_chunk_wrapper(
 
 
 class BaseDataParser(ABC):
+
+    sample_metadata: Optional[pd.DataFrame] = None
+    """
+    Will hold pandas DataFrame of sample metadata for current split
+    DataFrame columns:
+    - h5_path: Path to the HDF5 file containing the sample data
+    - scenario_id: Original scenario ID from ScenarioNet
+    - kalman_difficulty: Array with Kalman filter difficulty scores for all agents
+    - num_agents: Total number of agents in the scenario with valid trajectories
+    - num_agents_interest: Number of agents of interest in the scenario
+    - scenario_future_duration: Number of future timesteps in the scenario
+    - num_map_polylines: Number of map polylines in the scenario
+    - track_index_to_predict: Index of the track to predict
+    - center_objects_type: Type ID of the centered object
+    - dataset_name: Name of the dataset this sample belongs to
+    - trajectory_type: Type ID of the trajectory (if available)
+
+    The DataFrame index is the group_name in format: "{dataset_name}-{worker_idx}-{id_cnt}-{agent_idx}"
+    where:
+        - dataset_name: Name of the original dataset (e.g., "av2_scenarionet")
+        - worker_idx: Index of the worker that processed this chunk
+        - id_cnt: Counter for the scenario ID within this worker's chunk
+        - agent_idx: Index of the agent within this scenario
+    """
+
     def __init__(self, config: "DataParserConfig"):
         self.config = config
         self.paths: PathConfig = config.paths
 
-        # Will hold pandas DataFrame of sample metadata for current split
         self.sample_metadata: Optional[pd.DataFrame] = None
 
     def load_data(self) -> Self:
@@ -214,6 +239,8 @@ class BaseDataParser(ABC):
                 )
                 num_agents_interest = len(out)
                 for agent_idx, agent_record in enumerate(out):
+                    # Create a unique group name that encodes dataset, worker, scenario index, and agent index
+                    # This identifier serves as the key in sample_metadata and allows tracing back to original data
                     grp_name = f"{orig_ds_name}-{worker_idx}-{id_cnt}-{agent_idx}"
                     grp = hdf5_file.create_group(grp_name)
                     for key, value in agent_record.model_dump().items():
@@ -224,10 +251,11 @@ class BaseDataParser(ABC):
 
                     meta = {
                         "h5_path": hdf5_path,
+                        "scenario_id": sid,  # Original scenario ID from ScenarioNet
                         "kalman_difficulty": kd_arr,
                         "num_agents": np.sum(
                             np.any(agent_record.obj_trajs_last_pos != 0, axis=1)
-                        ).item(),
+                        ).item(),  # type: ignore
                         "num_agents_interest": num_agents_interest,
                         "scenario_future_duration": int(
                             agent_record.obj_trajs_future_mask.shape[1]
@@ -261,7 +289,13 @@ class BaseDataParser(ABC):
         )
         idx_path = self.paths.get_sample_metadata_path(split)
         try:
-            return pd.read_pickle(idx_path)
+            df = pd.read_pickle(idx_path)
+            if self.config.num_debug_samples is not None:
+                CONSOLE.log(
+                    f"Limiting to {self.config.num_debug_samples} / {len(df)} samples in {split.name}."
+                )
+                df = df.sample(n=min(self.config.num_debug_samples, len(df)))
+            return df
         except Exception as e:
             CONSOLE.error(f"Failed to load sample metadata DataFrame: {idx_path}: {e}")
             return pd.DataFrame()
