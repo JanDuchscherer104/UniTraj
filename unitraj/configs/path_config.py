@@ -1,10 +1,11 @@
 from pathlib import Path
-from typing import Annotated, List, Optional, Type, Union
+from typing import Annotated, List, Optional, Union
 
 from pydantic import Field, ValidationInfo, field_validator
 
 from ..datasets.types import Stage
-from ..utils.base_config import Console, SingletonConfig
+from ..utils.base_config import SingletonConfig
+from ..utils.console import Console
 
 
 class PathConfig(SingletonConfig):
@@ -18,6 +19,7 @@ class PathConfig(SingletonConfig):
     root: Path = Field(default_factory=lambda: Path(__file__).parents[5].resolve())
     checkpoints: Annotated[Path, Field(default=".logs/checkpoints")]
     """Directory for model checkpoints."""
+    wandb: Annotated[Path, Field(default=".logs/wandb")]
     configs: Annotated[Path, Field(default=".configs")]
     """Directory for configuration files."""
 
@@ -41,6 +43,7 @@ class PathConfig(SingletonConfig):
         "data_root",
         "checkpoints",
         "configs",
+        "wandb",
         mode="before",
     )
     @classmethod
@@ -55,7 +58,7 @@ class PathConfig(SingletonConfig):
         Returns:
             Path: The validated Path object.
         """
-        CONSOLE = Console.with_prefix(cls.__name__, "convert_to_path")
+        CONSOLE = Console.with_prefix(cls.__name__, "convert_to_path", info.field_name)
 
         if isinstance(v, str):
             root = info.data.get("root", Path.cwd())
