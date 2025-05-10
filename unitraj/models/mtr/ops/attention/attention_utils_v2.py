@@ -11,7 +11,9 @@ except ImportError:
     try:
         from attention import attention_cuda
     except ImportError:
-        print("Cannot import attention_cuda for MTR. Please check the cuda compilation.")
+        print(
+            "Cannot import attention_cuda for MTR. Please check the cuda compilation."
+        )
         pass
 """ Attention computation code v2."""
 
@@ -27,13 +29,15 @@ class AttentionWeightComputation(Function):
     """
 
     @staticmethod
-    def forward(ctx,
-                query_batch_cnt: torch.Tensor,
-                key_batch_cnt: torch.Tensor,
-                index_pair_batch: torch.Tensor,
-                index_pair: torch.Tensor,
-                query_features: torch.Tensor,
-                key_features: torch.Tensor):
+    def forward(
+        ctx,
+        query_batch_cnt: torch.Tensor,
+        key_batch_cnt: torch.Tensor,
+        index_pair_batch: torch.Tensor,
+        index_pair: torch.Tensor,
+        query_features: torch.Tensor,
+        key_features: torch.Tensor,
+    ):
         """
         :param ctx:
         :param query_batch_cnt: A integer tensor with shape [bs], indicating the query amount for each batch.
@@ -64,14 +68,33 @@ class AttentionWeightComputation(Function):
         output = torch.cuda.FloatTensor(total_query_num, local_size, nhead).zero_()
 
         attention_cuda.attention_weight_computation_wrapper_v2(
-            b, total_query_num, local_size, total_key_num, nhead, hdim,
-            query_batch_cnt, key_batch_cnt, index_pair_batch,
-            index_pair, query_features, key_features,
-            output)
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            query_features,
+            key_features,
+            output,
+        )
         ctx.for_backwards = (
-            b, total_query_num, local_size, total_key_num, nhead, hdim,
-            query_batch_cnt, key_batch_cnt, index_pair_batch,
-            index_pair, query_features, key_features
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            query_features,
+            key_features,
         )
         return output
 
@@ -85,21 +108,46 @@ class AttentionWeightComputation(Function):
             grad_query_features:  [total_query_num, nhead, hdim]
             grad_key_features: [total_key_num, nhead, hdim]
         """
-        (b, total_query_num, local_size, total_key_num, nhead, hdim,
-         query_batch_cnt, key_batch_cnt, index_pair_batch,
-         index_pair, query_features, key_features) = ctx.for_backwards
+        (
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            query_features,
+            key_features,
+        ) = ctx.for_backwards
 
-        grad_query_features = Variable(torch.cuda.FloatTensor(
-            total_query_num, nhead, hdim).zero_())
-        grad_key_features = Variable(torch.cuda.FloatTensor(
-            total_key_num, nhead, hdim).zero_())
+        grad_query_features = Variable(
+            torch.cuda.FloatTensor(total_query_num, nhead, hdim).zero_()
+        )
+        grad_key_features = Variable(
+            torch.cuda.FloatTensor(total_key_num, nhead, hdim).zero_()
+        )
 
         grad_out_data = grad_out.data.contiguous()
         attention_cuda.attention_weight_computation_grad_wrapper_v2(
-            b, total_query_num, local_size, total_key_num, nhead, hdim,
-            query_batch_cnt, key_batch_cnt, index_pair_batch,
-            index_pair, query_features, key_features,
-            grad_out_data, grad_query_features.data, grad_key_features.data)
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            query_features,
+            key_features,
+            grad_out_data,
+            grad_query_features.data,
+            grad_key_features.data,
+        )
         return None, None, None, None, grad_query_features, grad_key_features
 
 
@@ -117,13 +165,15 @@ class AttentionValueComputation(Function):
     """
 
     @staticmethod
-    def forward(ctx,
-                query_batch_cnt: torch.Tensor,
-                key_batch_cnt: torch.Tensor,
-                index_pair_batch: torch.Tensor,
-                index_pair: torch.Tensor,
-                attn_weight: torch.Tensor,
-                value_features: torch.Tensor):
+    def forward(
+        ctx,
+        query_batch_cnt: torch.Tensor,
+        key_batch_cnt: torch.Tensor,
+        index_pair_batch: torch.Tensor,
+        index_pair: torch.Tensor,
+        attn_weight: torch.Tensor,
+        value_features: torch.Tensor,
+    ):
         """
         :param ctx:
         :param query_batch_cnt: A integer tensor with shape [bs], indicating the query amount for each batch.
@@ -154,14 +204,33 @@ class AttentionValueComputation(Function):
         output = torch.cuda.FloatTensor(total_query_num, nhead, hdim).zero_()
 
         attention_cuda.attention_value_computation_wrapper_v2(
-            b, total_query_num, local_size, total_key_num, nhead, hdim,
-            query_batch_cnt, key_batch_cnt, index_pair_batch,
-            index_pair, attn_weight, value_features,
-            output)
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            attn_weight,
+            value_features,
+            output,
+        )
         ctx.for_backwards = (
-            b, total_query_num, local_size, total_key_num, nhead, hdim,
-            query_batch_cnt, key_batch_cnt, index_pair_batch,
-            index_pair, attn_weight, value_features
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            attn_weight,
+            value_features,
         )
         return output
 
@@ -175,21 +244,46 @@ class AttentionValueComputation(Function):
             grad_attn_weight:  [total_query_num, local_size, nhead]
             grad_value_features: [total_key_num, nhead, hdim]
         """
-        (b, total_query_num, local_size, total_key_num, nhead, hdim,
-         query_batch_cnt, key_batch_cnt, index_pair_batch,
-         index_pair, attn_weight, value_features) = ctx.for_backwards
+        (
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            attn_weight,
+            value_features,
+        ) = ctx.for_backwards
 
-        grad_attn_weight = Variable(torch.cuda.FloatTensor(
-            total_query_num, local_size, nhead).zero_())
-        grad_value_features = Variable(torch.cuda.FloatTensor(
-            total_key_num, nhead, hdim).zero_())
+        grad_attn_weight = Variable(
+            torch.cuda.FloatTensor(total_query_num, local_size, nhead).zero_()
+        )
+        grad_value_features = Variable(
+            torch.cuda.FloatTensor(total_key_num, nhead, hdim).zero_()
+        )
 
         grad_out_data = grad_out.data.contiguous()
         attention_cuda.attention_value_computation_grad_wrapper_v2(
-            b, total_query_num, local_size, total_key_num, nhead, hdim,
-            query_batch_cnt, key_batch_cnt, index_pair_batch,
-            index_pair, attn_weight, value_features,
-            grad_out_data, grad_attn_weight.data, grad_value_features.data)
+            b,
+            total_query_num,
+            local_size,
+            total_key_num,
+            nhead,
+            hdim,
+            query_batch_cnt,
+            key_batch_cnt,
+            index_pair_batch,
+            index_pair,
+            attn_weight,
+            value_features,
+            grad_out_data,
+            grad_attn_weight.data,
+            grad_value_features.data,
+        )
         return None, None, None, None, grad_attn_weight, grad_value_features
 
 
