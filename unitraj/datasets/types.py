@@ -317,6 +317,19 @@ class DatasetItem(BaseModel):
             return v
         return v
 
+    @field_validator("track_index_to_predict", "center_objects_type", mode="before")
+    @classmethod
+    def _validate_int64_fields(cls, v):
+        """Convert NumPy arrays and other numeric types to np.int64."""
+        if isinstance(v, np.ndarray):
+            try:
+                return np.int64(v.item())
+            except Exception:
+                pass
+        if isinstance(v, (int, float, np.number)):
+            return np.int64(v)
+        return v
+
     scenario_id: str = Field(...)
     """Scenario unique ID (|S36)
 
@@ -466,17 +479,6 @@ class DatasetItem(BaseModel):
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
-
-    def to_tensor_dict(self) -> Dict[str, Any]:
-        import torch
-
-        tdict = {}
-        for name, val in self.__dict__.items():
-            if isinstance(val, np.ndarray):
-                tdict[name] = torch.from_numpy(val)
-            else:
-                tdict[name] = val
-        return tdict
 
     def summary(self) -> str:
         sid = (
