@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import pytorch_lightning as pl
@@ -8,9 +8,56 @@ import torch
 import unitraj.datasets.common_utils as common_utils
 import unitraj.utils.visualization as visualization
 import wandb
+from pydantic import Field
 from pytorch_lightning.loggers import WandbLogger
 
 from ...datasets.types import BatchDict
+from ...utils.base_config import BaseConfig
+
+
+class BaseModelConfig(BaseConfig):
+    """Base configuration for trajectory prediction models."""
+
+    # Training parameters
+    # max_epochs: int = Field(
+    #     default=100, description="Maximum number of training epochs"
+    # )
+    learning_rate: float = Field(default=0.00075, description="Initial learning rate")
+    learning_rate_sched: List[int] = Field(
+        default=[10, 20, 30, 40, 50],
+        description="Epochs at which to decrease learning rate",
+    )
+    optimizer: str = Field(default="Adam", description="Optimizer type")
+    scheduler: str = Field(
+        default="multistep", description="Learning rate scheduler type"
+    )
+    ewc_lambda: float = Field(default=2000.0, description="EWC regularization strength")
+
+    # Batch sizes
+    # train_batch_size: int = Field(default=128, description="Training batch size")
+    # eval_batch_size: int = Field(default=256, description="Evaluation batch size")
+    grad_clip_norm: float = Field(default=5.0, description="Gradient clipping norm")
+
+    # Data parameters
+    past_len: int = Field(default=21, description="Length of observed history (frames)")
+    future_len: int = Field(
+        default=60, description="Length of prediction horizon (frames)"
+    )
+
+    # Evaluation parameters
+    eval: bool = Field(default=False, description="Whether to perform evaluation")
+    eval_waymo: bool = Field(default=False, description="Whether to evaluate on Waymo")
+    eval_nuscenes: bool = Field(
+        default=False, description="Whether to evaluate on NuScenes"
+    )
+    eval_argoverse2: bool = Field(
+        default=False, description="Whether to evaluate on Argoverse 2"
+    )
+    nuscenes_dataroot: Optional[str] = Field(
+        default=None, description="Path to NuScenes dataset"
+    )
+
+    visualize_eval_predictions: bool = False
 
 
 class BaseModel(pl.LightningModule):
@@ -25,16 +72,22 @@ class BaseModel(pl.LightningModule):
     - configure_optimizers: Optimizer configuration
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: BaseModelConfig):
         """
         Initialize the base model.
 
         Args:
-            config: Configuration dictionary for the model.
+            config: Configuration object for the model.
         """
         super().__init__()
         self.config = config
-        self.save_hyperparameters(config)
+        self.save_hyperparameters(
+            {
+                k: v
+                for k, v in config.model_dump().items()
+                if k != "target"  # Exclude target field
+            }
+        )
         self.pred_dicts: List[Dict[str, Any]] = []
 
         # Initialize tracking of best metrics
@@ -44,10 +97,8 @@ class BaseModel(pl.LightningModule):
             "val/brier_fde": float("inf"),
         }
 
-        # WandB logger setup check
-        self._wandb_ready: bool = False
-
-        if config.get("eval_nuscenes", False):
+        # Access config attributes properly instead of using get()
+        if self.config.eval_nuscenes:
             self.init_nuscenes()
 
     def init_nuscenes(self) -> None:
@@ -57,13 +108,13 @@ class BaseModel(pl.LightningModule):
         This method imports and initializes NuScenes related components that are
         needed for evaluation when using the NuScenes dataset.
         """
-        if self.config.get("eval_nuscenes", False):
+        if self.config.eval_nuscenes:
             from nuscenes import NuScenes
             from nuscenes.eval.prediction.config import PredictionConfig
             from nuscenes.prediction import PredictHelper
 
             nusc = NuScenes(
-                version="v1.0-trainval", dataroot=self.config["nuscenes_dataroot"]
+                version="v1.0-trainval", dataroot=self.config.nuscenes_dataroot
             )
 
             # Prediction helper and configs:
@@ -124,7 +175,7 @@ class BaseModel(pl.LightningModule):
         """Log metrics at the end of each validation epoch."""
         metric_results = None
 
-        if self.config.get("eval_waymo", False):
+        if self.config.eval_waymo:
             metric_results, result_format_str = self.compute_metrics_waymo(
                 self.pred_dicts
             )
@@ -135,8 +186,7 @@ class BaseModel(pl.LightningModule):
             if hasattr(self, "logger") and self.logger is not None:
                 self._log_metrics_to_wandb("val/waymo", metric_results)
 
-        elif self.config.get("eval_nuscenes", False):
-
+        elif self.config.eval_nuscenes:
             os.makedirs("submission", exist_ok=True)
             json.dump(
                 self.pred_dicts,
@@ -149,7 +199,7 @@ class BaseModel(pl.LightningModule):
             if hasattr(self, "logger") and self.logger is not None:
                 self._log_metrics_to_wandb("val/nuscenes", metric_results)
 
-        elif self.config.get("eval_argoverse2", False):
+        elif self.config.eval_argoverse2:
             metric_results = self.compute_metrics_av2(self.pred_dicts)
 
             # Log metrics to wandb (already being logged in compute_metrics_av2)
@@ -301,7 +351,7 @@ class BaseModel(pl.LightningModule):
         return metric_results
 
     def compute_official_evaluation(self, batch_dict: BatchDict, prediction):
-        if self.config.get("eval_waymo", False):
+        if self.config.eval_waymo:
 
             input_dict = batch_dict["input_dict"]
             pred_scores = prediction["predicted_probability"]
@@ -344,7 +394,7 @@ class BaseModel(pl.LightningModule):
 
             self.pred_dicts += pred_dict_list
 
-        elif self.config.get("eval_nuscenes", False):
+        elif self.config.eval_nuscenes:
             from nuscenes.eval.prediction.data_classes import Prediction
 
             input_dict = batch_dict["input_dict"]
@@ -388,7 +438,7 @@ class BaseModel(pl.LightningModule):
 
             self.pred_dicts += pred_dict_list
 
-        elif self.config.get("eval_argoverse2", False):
+        elif self.config.eval_argoverse2:
 
             input_dict = batch_dict["input_dict"]
             pred_scores = prediction["predicted_probability"]
@@ -510,7 +560,7 @@ class BaseModel(pl.LightningModule):
         # merge new_dict with log_dict
         loss_dict.update(new_dict)
 
-        if status == "val" and self.config.get("eval", False):
+        if status == "val" and self.config.eval:
 
             # Split scores based on trajectory type
             new_dict = {}
@@ -631,12 +681,14 @@ class BaseModel(pl.LightningModule):
             batch_idx: The index of the current batch
             dataloader_idx: The index of the dataloader
         """
-        # Only log images for the first few batches to avoid too many images in wandb
+        # Only log images for the first few batches
         if (
-            batch_idx < 3
+            batch_idx == 0
             and hasattr(self, "logger")
             and isinstance(self.logger, WandbLogger)
         ):
+            if not self.config.visualize_eval_predictions:
+                return
             try:
                 # Generate the prediction for this batch
                 prediction, _ = self.forward(batch)

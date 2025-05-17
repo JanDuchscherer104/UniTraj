@@ -69,7 +69,13 @@ class LitDatamodule(pl.LightningDataModule):
         super().__init__()
         self.config = config
         # save_hyperparameters
-        self.save_hyperparameters(config.model_dump())
+        self.save_hyperparameters(
+            {
+                k: v
+                for k, v in config.model_dump().items()
+                if k not in ["target", "dataset_config"]
+            }
+        )
 
         self.train_dataset: Optional[BaseDataset] = None
         self.val_dataset: Optional[BaseDataset] = None

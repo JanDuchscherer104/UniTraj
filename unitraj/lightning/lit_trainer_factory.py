@@ -5,12 +5,8 @@ from typing import List, Literal, Optional, Type, Union
 import pytorch_lightning as pl
 import torch
 from pydantic import Field, field_validator, model_validator
-from pytorch_lightning.callbacks import (
-    Callback,
-    EarlyStopping,
-    LearningRateMonitor,
-    ModelCheckpoint,
-)
+from pytorch_lightning.callbacks import (Callback, EarlyStopping,
+                                         LearningRateMonitor, ModelCheckpoint)
 from pytorch_lightning.loggers import Logger
 from typing_extensions import Self
 
