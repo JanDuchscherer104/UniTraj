@@ -10,12 +10,10 @@ from scipy import special
 from torch import optim
 from torch.distributions import Laplace, MultivariateNormal
 from torch.optim.lr_scheduler import MultiStepLR
-from unitraj.models.base_model.base_model import BaseModel
-
-from ...utils.base_config import BaseConfig
+from unitraj.models.base_model.base_model import BaseModel, BaseModelConfig
 
 
-class AutoBotConfig(BaseConfig["AutoBotEgo"]):
+class AutoBotConfig(BaseModelConfig["AutoBotEgo"]):
     target: Type["AutoBotEgo"] = Field(default_factory=lambda: AutoBotEgo)
     model_name: str = Field(default="autobot")
     num_modes: int = Field(default=6)
@@ -26,19 +24,9 @@ class AutoBotConfig(BaseConfig["AutoBotEgo"]):
     tx_num_heads: int = Field(default=16)
     dropout: float = Field(default=0.1)
 
-    past_len: int = Field(default=21, description="Length of observed history (frames)")
-    future_len: int = Field(default=60, description="Length of prediction horizon (frames)")
-
     entropy_weight: float = Field(default=40.0)
     kl_weight: float = Field(default=20.0)
     use_FDEADE_aux_loss: bool = Field(default=True)
-
-    max_epochs: int = Field(default=100)
-    learning_rate: float = Field(default=0.00075)
-    learning_rate_sched: List[int] = Field(default=[10, 20, 30, 40, 50])
-    optimizer: str = Field(default="Adam")
-    scheduler: str = Field(default="multistep")
-    ewc_lambda: float = Field(default=2000.0)
 
     train_batch_size: int = Field(default=128)
     eval_batch_size: int = Field(default=256)
@@ -258,13 +246,14 @@ class AutoBotEgo(BaseModel):
 
     def __init__(self, config: AutoBotConfig):
 
-        config = config.model_dump()
         super(AutoBotEgo, self).__init__(config)
 
         self.config = config
         init_ = lambda m: init(
             m, nn.init.xavier_normal_, lambda x: nn.init.constant_(x, 0), np.sqrt(2)
         )
+
+        config = config.model_dump()
         self.T = config["future_len"]
         self.past = config["past_len"]
         self.fisher_information = None
@@ -356,7 +345,7 @@ class AutoBotEgo(BaseModel):
         )
         self.prob_predictor = init_(nn.Linear(self.d_k, 1))
 
-        self.criterion = Criterion(self.config)
+        self.criterion = Criterion(self.config.model_dump())
 
         self.fisher_information = None
         self.optimal_params = None
@@ -585,11 +574,11 @@ class AutoBotEgo(BaseModel):
 
     def configure_optimizers(self):
         optimizer = optim.Adam(
-            self.parameters(), lr=self.config["learning_rate"], eps=0.0001
+            self.parameters(), lr=self.config.learning_rate, eps=0.0001
         )
         scheduler = MultiStepLR(
             optimizer,
-            milestones=self.config["learning_rate_sched"],
+            milestones=self.config.learning_rate_sched,
             gamma=0.5,
             verbose=True,
         )
