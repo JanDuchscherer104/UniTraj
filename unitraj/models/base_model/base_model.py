@@ -652,6 +652,7 @@ class BaseModel(pl.LightningModule):
             and hasattr(self, "logger")
             and isinstance(self.logger, WandbLogger)
             and self.logger.experiment is not None
+            and self.config.visualize_eval_predictions
         ):
             try:
                 # Sample a few trajectories to visualize
