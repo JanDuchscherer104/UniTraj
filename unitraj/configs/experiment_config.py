@@ -1,9 +1,9 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import pytorch_lightning as pl
 import torch
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
-from pyexpat import model
 from typing_extensions import Self
 
 from ..datasets.types import Stage
@@ -19,7 +19,7 @@ from .path_config import PathConfig
 
 class ExperimentConfig(BaseConfig):
     # experiment settings
-    seed: Optional[int] = 43
+    seed: Optional[int] = 42
     """Random seed for reproducibility"""
 
     is_debug: bool = True
@@ -36,7 +36,7 @@ class ExperimentConfig(BaseConfig):
     """Use Argoverse2 evaluation tool"""
 
     # Use new Lightning configs
-    method: AutoBotConfig = Field(default_factory=AutoBotConfig)
+    model: AutoBotConfig = Field(default_factory=AutoBotConfig)
     """Lightning Module configuration (specific model config)."""
 
     datamodule: LitDatamoduleConfig = Field(default_factory=LitDatamoduleConfig)
@@ -49,9 +49,32 @@ class ExperimentConfig(BaseConfig):
     paths: PathConfig = Field(default_factory=PathConfig)
     """Path configuration"""
 
-    # Optional: Checkpoint path override
-    ckpt_path: Optional[str] = None
-    """Explicit path to a checkpoint to load."""
+    ckpt_path: Optional[Annotated[Path, str]] = Field(None)
+    """Path to a checkpoint to load. Relative to paths.checkpoints."""
+
+    @field_validator(
+        "ckpt_path",
+        mode="before",
+    )
+    @classmethod
+    def _convert_to_path(
+        cls, v: Union[str, Path], info: ValidationInfo
+    ) -> Optional[Path]:
+        if v is None:
+            return None
+        if isinstance(v, (str, Path)):
+            paths = info.data.get("paths")
+            assert (
+                paths is not None
+            ), "PathConfig must be initialized before using them."
+            assert isinstance(paths, PathConfig)
+
+            v = paths.checkpoints / v if not Path(v).is_absolute() else Path(v)
+        v = v.resolve()
+
+        assert v.exists(), f"Checkpoint path {v} does not exist."
+
+        return v
 
     @model_validator(mode="before")
     @classmethod
@@ -104,8 +127,8 @@ class ExperimentConfig(BaseConfig):
         """
         if self.paths:  # Ensure self.paths itself is initialized
             sub_configs_to_update = []
-            if hasattr(self, "method") and self.method is not None:
-                sub_configs_to_update.append(self.method)
+            if hasattr(self, "method") and self.model is not None:
+                sub_configs_to_update.append(self.model)
             if hasattr(self, "datamodule") and self.datamodule is not None:
                 sub_configs_to_update.append(self.datamodule)
             if hasattr(self, "trainer") and self.trainer is not None:
@@ -113,8 +136,6 @@ class ExperimentConfig(BaseConfig):
 
             for sub_cfg in sub_configs_to_update:
                 if hasattr(sub_cfg, "paths"):
-                    # This sets the 'paths' attribute on the sub_cfg instance
-                    # to be the same instance as self.paths.
                     setattr(sub_cfg, "paths", self.paths)
         return self
 
@@ -130,29 +151,65 @@ class ExperimentConfig(BaseConfig):
             set_seed(self.seed)
         return self
 
-    def setup_target(
-        self, stage: Union[Stage, str] = Stage.TRAIN
-    ) -> Tuple[pl.Trainer, BaseModel, LitDatamodule]:
+    def setup_target(self) -> Tuple[pl.Trainer, BaseModel, LitDatamodule]:
         """
         Sets up and runs the training/evaluation process using PyTorch Lightning.
 
         Args:
             stage (str): The stage to run ('fit', 'test', 'validate', 'predict'). Defaults to 'fit'.
         """
-        stage = stage if isinstance(stage, Stage) else Stage.from_str(stage)
-        assert isinstance(stage, Stage)
 
         CONSOLE = Console.with_prefix(self.__class__.__name__, "setup_target")
 
         # Instantiate components
         CONSOLE.log("Instantiating lightning components...")
         datamodule = self.datamodule.setup_target()
-        model = self.method.setup_target()
+        model = self.model.setup_target()
         trainer_factory = self.trainer.setup_target()
 
         trainer: pl.Trainer = trainer_factory.create_trainer()
 
         return trainer, model, datamodule
+
+    def setup_target_and_run(
+        self, stage: Union[Stage, Literal["train", "fit", "val", "test"]] = Stage.TRAIN
+    ) -> pl.Trainer:
+        stage = stage if isinstance(stage, Stage) else Stage.from_str(stage)
+        CONSOLE = Console.with_prefix(
+            self.__class__.__name__, "setup_target_and_run", stage.name
+        )
+
+        ckpt_path = None
+        if self.ckpt_path is not None:
+            CONSOLE.log(f"Will contunue from checkpoint: {self.ckpt_path}")
+            ckpt_path = self.ckpt_path
+
+        trainer, model, datamodule = self.setup_target()
+
+        if stage == Stage.TRAIN:
+            CONSOLE.log("Starting training (fit)...")
+            trainer.fit(
+                model=model,
+                datamodule=datamodule,
+                ckpt_path=ckpt_path,
+            )
+        elif stage == Stage.VAL:
+            CONSOLE.log("Starting validation...")
+            trainer.validate(
+                model=model,
+                datamodule=datamodule,
+                ckpt_path=ckpt_path,
+            )
+        elif stage == Stage.TEST:
+            CONSOLE.log("Starting testing...")
+            trainer.test(
+                model=model,
+                datamodule=datamodule,
+                ckpt_path=ckpt_path,
+            )
+        else:
+            CONSOLE.error(f"Unsupported stage: {stage}")
+            raise ValueError(f"Unsupported stage: {stage}")
 
         # # Determine checkpoint path
         # ckpt_path_to_load = self.ckpt_path
