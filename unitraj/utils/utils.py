@@ -18,7 +18,7 @@ def find_latest_checkpoint(search_pattern):
     return latest_file
 
 
-def set_seed(seed_value=42):
+def set_seed(seed_value: int):
     """
     Set seed for reproducibility in PyTorch Lightning based training.
 
