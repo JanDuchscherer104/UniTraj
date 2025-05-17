@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pytorch_lightning as pl
 import torch
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pyexpat import model
 from typing_extensions import Self
 
 from ..datasets.types import Stage
@@ -18,58 +19,116 @@ from .path_config import PathConfig
 
 class ExperimentConfig(BaseConfig):
     # experiment settings
-    seed: int = Field(42, description="Random seed for reproducibility")
-    is_debug: bool = Field(
-        True, description="Debug mode (affects logging, checkpoints, etc.)"
-    )
+    seed: Optional[int] = 43
+    """Random seed for reproducibility"""
+
+    is_debug: bool = True
+    """Debug mode (affects logging, checkpoints, etc.)"""
 
     # evaluation settings
-    eval_nuscenes: bool = Field(False, description="Use nuScenes evaluation tool")
-    eval_waymo: bool = Field(False, description="Use Waymo evaluation tool")
-    eval_argoverse2: bool = Field(False, description="Use Argoverse2 evaluation tool")
+    eval_nuscenes: bool = False
+    """Use nuScenes evaluation tool"""
+
+    eval_waymo: bool = False
+    """Use Waymo evaluation tool"""
+
+    eval_argoverse2: bool = False
+    """Use Argoverse2 evaluation tool"""
 
     # Use new Lightning configs
-    method: AutoBotConfig = Field(
-        default_factory=AutoBotConfig,
-        description="Lightning Module configuration (specific model config).",
-    )
-    datamodule: LitDatamoduleConfig = Field(
-        default_factory=LitDatamoduleConfig,
-    )
-    trainer: LitTrainerFactoryConfig = Field(
-        default_factory=LitTrainerFactoryConfig,
-        description="Lightning Trainer factory configuration.",
-    )
+    method: AutoBotConfig = Field(default_factory=AutoBotConfig)
+    """Lightning Module configuration (specific model config)."""
+
+    datamodule: LitDatamoduleConfig = Field(default_factory=LitDatamoduleConfig)
+    """Lightning DataModule configuration."""
+
+    trainer: LitTrainerFactoryConfig = Field(default_factory=LitTrainerFactoryConfig)
+    """Lightning Trainer factory configuration."""
 
     # Keep PathConfig
-    paths: PathConfig = Field(
-        default_factory=PathConfig, description="Path configuration"
-    )
+    paths: PathConfig = Field(default_factory=PathConfig)
+    """Path configuration"""
 
     # Optional: Checkpoint path override
-    ckpt_path: Optional[str] = Field(
-        None, description="Explicit path to a checkpoint to load."
-    )
+    ckpt_path: Optional[str] = None
+    """Explicit path to a checkpoint to load."""
 
     @model_validator(mode="before")
     @classmethod
-    def propagate_is_debug(cls, data: Dict[str, Any]) -> Dict[str, Any]:
-        is_debug = data.get("is_debug", False)
+    def _propagate_is_debug_to_data(
+        cls, data: Dict[str, Any]
+    ) -> Dict[str, Any]:  # Renamed for clarity
+        is_debug = data.get("is_debug", False)  # Default to False if not present
 
-        if is_debug:
-            # Ensure 'datamodule' is a dict and set 'is_debug'
-            datamodule = data.get("datamodule", {})
-            if isinstance(datamodule, dict):
-                datamodule.setdefault("is_debug", True)
-                data["datamodule"] = datamodule
+        # Ensure 'method' is a dict and set 'is_debug' if not already present
+        method_cfg = data.get("method", {})
+        if isinstance(method_cfg, dict):
+            method_cfg.setdefault("is_debug", is_debug)
+            data["method"] = method_cfg
+        elif isinstance(method_cfg, BaseModel) and hasattr(
+            method_cfg, "is_debug"
+        ):  # If already an instance
+            if getattr(method_cfg, "is_debug", None) is None:  # only set if not set
+                setattr(method_cfg, "is_debug", is_debug)
 
-            # Ensure 'trainer' is a dict and set 'is_debug'
-            trainer = data.get("trainer", {})
-            if isinstance(trainer, dict):
-                trainer.setdefault("is_debug", True)
-                data["trainer"] = trainer
+        # Ensure 'datamodule' is a dict and set 'is_debug' if not already present
+        datamodule_cfg = data.get("datamodule", {})
+        if isinstance(datamodule_cfg, dict):
+            datamodule_cfg.setdefault("is_debug", is_debug)
+            data["datamodule"] = datamodule_cfg
+        elif isinstance(datamodule_cfg, BaseModel) and hasattr(
+            datamodule_cfg, "is_debug"
+        ):
+            if getattr(datamodule_cfg, "is_debug", None) is None:
+                setattr(datamodule_cfg, "is_debug", is_debug)
+
+        # Ensure 'trainer' is a dict and set 'is_debug' if not already present
+        trainer_cfg = data.get("trainer", {})
+        if isinstance(trainer_cfg, dict):
+            trainer_cfg.setdefault("is_debug", is_debug)
+            data["trainer"] = trainer_cfg
+        elif isinstance(trainer_cfg, BaseModel) and hasattr(trainer_cfg, "is_debug"):
+            if getattr(trainer_cfg, "is_debug", None) is None:
+                setattr(trainer_cfg, "is_debug", is_debug)
 
         return data
+
+    @model_validator(mode="after")
+    def _propagate_path_config_to_children(self) -> Self:
+        """
+        Propagates the main 'paths' config to children that have a 'paths' attribute.
+        For this to work optimally with TOML serialization (avoiding duplicates),
+        the 'paths' field in child configurations (e.g., AutoBotConfig,
+        LitDatamoduleConfig, LitTrainerFactoryConfig) should be defined as:
+        `paths: Optional[PathConfig] = Field(None, exclude=True)`
+        """
+        if self.paths:  # Ensure self.paths itself is initialized
+            sub_configs_to_update = []
+            if hasattr(self, "method") and self.method is not None:
+                sub_configs_to_update.append(self.method)
+            if hasattr(self, "datamodule") and self.datamodule is not None:
+                sub_configs_to_update.append(self.datamodule)
+            if hasattr(self, "trainer") and self.trainer is not None:
+                sub_configs_to_update.append(self.trainer)
+
+            for sub_cfg in sub_configs_to_update:
+                if hasattr(sub_cfg, "paths"):
+                    # This sets the 'paths' attribute on the sub_cfg instance
+                    # to be the same instance as self.paths.
+                    setattr(sub_cfg, "paths", self.paths)
+        return self
+
+    @model_validator(mode="after")
+    def _set_seed(self) -> Self:
+        """
+        Sets the random seed for reproducibility.
+        """
+        if self.seed is not None:
+            Console.with_prefix(self.__class__.__name__, "_set_seed").log(
+                f"Setting random seed to {self.seed} (np, torch, cuda, random, pl)"
+            )
+            set_seed(self.seed)
+        return self
 
     def setup_target(
         self, stage: Union[Stage, str] = Stage.TRAIN
@@ -82,11 +141,8 @@ class ExperimentConfig(BaseConfig):
         """
         stage = stage if isinstance(stage, Stage) else Stage.from_str(stage)
         assert isinstance(stage, Stage)
-        set_seed(self.seed)
 
-        CONSOLE = Console.with_prefix(
-            self.__class__.__name__, "setup_target"
-        ).set_debug(self.is_debug)
+        CONSOLE = Console.with_prefix(self.__class__.__name__, "setup_target")
 
         # Instantiate components
         CONSOLE.log("Instantiating lightning components...")
