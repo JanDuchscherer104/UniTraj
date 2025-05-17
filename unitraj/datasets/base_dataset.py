@@ -31,6 +31,7 @@ class DatasetConfig(BaseConfig["BaseDataset"]):
     is_debug: bool = Field(
         False, description="Debug mode (no MP, limited samples, CPU only)"
     )
+    max_num_samples: Optional[int] = 1024
 
     # Paths - Ensure PathConfig is used
     paths: PathConfig = Field(default_factory=PathConfig)
@@ -53,11 +54,20 @@ class DatasetConfig(BaseConfig["BaseDataset"]):
 class BaseDataset(Dataset):
 
     def __init__(self, config: DatasetConfig):
+        CONSOLE = Console.with_prefix(self.__class__.__name__)
         self.config = config
 
         self.data_samples = (
             self.config.parser.setup_target().load_data().get_sample_metadata()
         )
+        if self.config.max_num_samples:
+            num_full = len(self.data_samples)
+            self.data_samples = self.data_samples.sample(n=self.config.max_num_samples)
+
+            CONSOLE.log(
+                f"Using {self.config.max_num_samples} samples out of {num_full} total samples."
+            )
+
         # Reset index name to group name
         self.data_samples.index.name = "group_name"
 
