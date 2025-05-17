@@ -360,7 +360,7 @@ class DatasetItem(BaseModel):
     track_index_to_predict: np.int64 = Field(...)
     """Index of agent-to-predict in [0, Nmax). Typically 0.
 
-    The integer index of the "center" agent (the prediction target) within the set of all Nmax agents in this sample.
+    The integer index of the "center" age!nt (the prediction target) within the set of all Nmax agents in this sample.
     This index is crucial for extracting the correct ground-truth trajectory and for associating predictions with the
     correct agent.
     """
@@ -445,7 +445,31 @@ class DatasetItem(BaseModel):
     map_polylines: np.ndarray = Field(...)
     """[K, L, Fmap] Map polyline features.
 
-    Contains K polylines (e.g., lanes, crosswalks), each with L points, and Fmap features per point (such as position, heading, type, etc.), all normalized relative to the center agent. These features provide the context of the static environment for prediction.
+    Contains K polylines (e.g., lanes, crosswalks), each with L points, and Fmap features per point, all normalized
+    relative to the center agent.
+
+    The Fmap dimension consists of:
+    - [0:3] Position (x, y, z): Spatial coordinates of the polyline point.
+    - [3:6] Direction (x, y, z): Direction vector at the polyline point.
+    - [6:9] Previous point position (x, y, z): Position of the previous point in the polyline.
+    - [9:29] Lane type one-hot encoding: Represents different lane types as defined in PolylineType enum:
+        - UNSET (0)
+        - LANE_FREEWAY (1)
+        - LANE_SURFACE_STREET (2)
+        - LANE_BIKE_LANE (3)
+        - LINE_BROKEN_SINGLE_WHITE (6)
+        - LINE_SOLID_SINGLE_WHITE (7)
+        - LINE_SOLID_DOUBLE_WHITE (8)
+        - LINE_BROKEN_SINGLE_YELLOW (9)
+        - LINE_BROKEN_DOUBLE_YELLOW (10)
+        - LINE_SOLID_SINGLE_YELLOW (11)
+        - LINE_SOLID_DOUBLE_YELLOW (12)
+        - LINE_PASSING_DOUBLE_YELLOW (13)
+        - BOUNDARY_LINE (15)
+        - BOUNDARY_MEDIAN (16)
+        - STOP_SIGN (17)
+        - CROSSWALK (18)
+        - SPEED_BUMP (19)
     """
 
     map_polylines_mask: np.ndarray = Field(...)
@@ -575,7 +599,34 @@ class BatchInputDict(TypedDict):
     center_gt_trajs_src: Tensor
     """[B, T, 10] Batched original world-frame trajectories."""
     map_polylines: Tensor
-    """[B, K, L, Fmap] Batched map polyline features."""
+    """[B, K, L, Fmap] Batched map polyline features.
+
+    Contains K polylines (e.g., lanes, crosswalks), each with L points, and Fmap features per point, all normalized
+    relative to the center agent.
+
+    The Fmap dimension consists of:
+    - [0:3] Position (x, y, z): Spatial coordinates of the polyline point.
+    - [3:6] Direction (x, y, z): Direction vector at the polyline point.
+    - [6:9] Previous point position (x, y, z): Position of the previous point in the polyline.
+    - [9:29] Lane type one-hot encoding: Represents different lane types as defined in PolylineType enum:
+        - UNSET (0)
+        - LANE_FREEWAY (1)
+        - LANE_SURFACE_STREET (2)
+        - LANE_BIKE_LANE (3)
+        - LINE_BROKEN_SINGLE_WHITE (6)
+        - LINE_SOLID_SINGLE_WHITE (7)
+        - LINE_SOLID_DOUBLE_WHITE (8)
+        - LINE_BROKEN_SINGLE_YELLOW (9)
+        - LINE_BROKEN_DOUBLE_YELLOW (10)
+        - LINE_SOLID_SINGLE_YELLOW (11)
+        - LINE_SOLID_DOUBLE_YELLOW (12)
+        - LINE_PASSING_DOUBLE_YELLOW (13)
+        - BOUNDARY_LINE (15)
+        - BOUNDARY_MEDIAN (16)
+        - STOP_SIGN (17)
+        - CROSSWALK (18)
+        - SPEED_BUMP (19)
+    """
     map_polylines_mask: Tensor
     """[B, K, L] Batched polyline masks."""
     map_polylines_center: Tensor
@@ -613,7 +664,7 @@ class Stage(Enum):
         return None
 
 
-traffic_light_state_to_int = {
+TRAFFIC_LIGHT_STATE_TO_INT = {
     None: 0,
     MetaDriveType.LANE_STATE_UNKNOWN: 0,
     # // States for traffic signals with arrows.
@@ -628,6 +679,18 @@ traffic_light_state_to_int = {
     MetaDriveType.LANE_STATE_FLASHING_STOP: 7,
     MetaDriveType.LANE_STATE_FLASHING_CAUTION: 8,
 }
+
+TRAJECTORY_TYPE_MAP = {
+    0: "stationary",
+    1: "straight",
+    2: "straight_right",
+    3: "straight_left",
+    4: "right_u_turn",
+    5: "right_turn",
+    6: "left_u_turn",
+    7: "left_turn",
+}
+AGENT_TYPE_MAP = {0: "unset", 1: "vehicle", 2: "pedestrian", 3: "bicycle", 4: "other"}
 
 
 class ObjectType(Enum):
