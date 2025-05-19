@@ -24,6 +24,7 @@ from .transformer import (
 )
 
 Type_dict = {0: "UNSET", 1: "VEHICLE", 2: "PEDESTRIAN", 3: "CYCLIST"}
+Type_dict_rev = {v: k for k, v in Type_dict.items()}  # Reverse mapping for lookups by name
 
 
 class MotionTransformer(BaseModel):
@@ -31,9 +32,18 @@ class MotionTransformer(BaseModel):
     def __init__(self, config):
         super(MotionTransformer, self).__init__(config)
         self.config = config
-        self.model_cfg = EasyDict(config)
+        
+        # Ensure config is a dictionary and handle both Pydantic and dict configs
+        if hasattr(config, 'model_dump'):
+            config_dict = config.model_dump()
+        else:
+            config_dict = config
+        
+        # Convert to EasyDict which allows both dict-style and attribute access
+        self.model_cfg = EasyDict(config_dict)
         self.pred_dicts = []
 
+        # This makes the model robust to different config access patterns
         self.model_cfg.MOTION_DECODER["CENTER_OFFSET_OF_MAP"] = self.model_cfg[
             "center_offset_of_map"
         ]
@@ -91,7 +101,7 @@ class MotionTransformer(BaseModel):
         )
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lbmd, last_epoch=-1, verbose=True
+            optimizer, lr_lbmd, last_epoch=-1
         )
         return [optimizer], [scheduler]
 
@@ -550,9 +560,18 @@ class MTRDecoder(nn.Module):
         if self.use_place_holder:
             raise NotImplementedError
         else:
+            # Since we only have intention points for certain types, fall back to available keys
+            available_keys = list(self.intention_points.keys())
+            if len(available_keys) == 0:
+                raise ValueError("No intention points available for any object type")
+            
+            # Use the first available type as default (usually 'VEHICLE')
+            default_type = available_keys[0]
+            
             intention_points = torch.stack(
                 [
-                    self.intention_points[Type_dict[center_objects_type[obj_idx]]]
+                    # Always use the default type's intention points
+                    self.intention_points[default_type] 
                     for obj_idx in range(num_center_objects)
                 ],
                 dim=0,

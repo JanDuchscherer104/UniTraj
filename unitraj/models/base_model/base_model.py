@@ -81,13 +81,20 @@ class BaseModel(pl.LightningModule):
         """
         super().__init__()
         self.config = config
-        self.save_hyperparameters(
-            {
+
+        # Handle both Pydantic models and dictionaries
+        if hasattr(config, 'model_dump'):
+            config_dict = {
                 k: v
                 for k, v in config.model_dump().items()
                 if k != "target"  # Exclude target field
             }
-        )
+        else:
+            # Already a dict
+            config_dict = {k: v for k, v in config.items() if k != "target"}
+            
+        self.save_hyperparameters(config_dict)
+        
         self.pred_dicts: List[Dict[str, Any]] = []
 
         # Initialize tracking of best metrics
@@ -96,10 +103,25 @@ class BaseModel(pl.LightningModule):
             "val/minFDE6": float("inf"),
             "val/brier_fde": float("inf"),
         }
-
-        # Access config attributes properly instead of using get()
-        if self.config.eval_nuscenes:
-            self.init_nuscenes()
+        
+        # Add debugging to log what type of config we're dealing with
+        print(f"BaseModel initialized with config type: {type(self.config)}")
+        
+    def get_config_attr(self, name, default=False):
+        """
+        Safely get a config attribute regardless of whether config is a dict or object.
+        
+        Args:
+            name: Name of the attribute to get
+            default: Default value if the attribute doesn't exist
+            
+        Returns:
+            The attribute value or default if not found
+        """
+        if isinstance(self.config, dict):
+            return self.config.get(name, default)
+        else:
+            return getattr(self.config, name, default)
 
     def init_nuscenes(self) -> None:
         """
@@ -108,13 +130,14 @@ class BaseModel(pl.LightningModule):
         This method imports and initializes NuScenes related components that are
         needed for evaluation when using the NuScenes dataset.
         """
-        if self.config.eval_nuscenes:
+        # Use helper method for safe config access
+        if self.get_config_attr('eval_nuscenes'):
             from nuscenes import NuScenes
             from nuscenes.eval.prediction.config import PredictionConfig
             from nuscenes.prediction import PredictHelper
 
             nusc = NuScenes(
-                version="v1.0-trainval", dataroot=self.config.nuscenes_dataroot
+                version="v1.0-trainval", dataroot=self.get_config_attr('nuscenes_dataroot', None)
             )
 
             # Prediction helper and configs:
@@ -175,7 +198,8 @@ class BaseModel(pl.LightningModule):
         """Log metrics at the end of each validation epoch."""
         metric_results = None
 
-        if self.config.eval_waymo:
+        # Use the helper method for safe config access
+        if self.get_config_attr('eval_waymo'):
             metric_results, result_format_str = self.compute_metrics_waymo(
                 self.pred_dicts
             )
@@ -185,8 +209,9 @@ class BaseModel(pl.LightningModule):
             # Log metrics to wandb
             if hasattr(self, "logger") and self.logger is not None:
                 self._log_metrics_to_wandb("val/waymo", metric_results)
-
-        elif self.config.eval_nuscenes:
+        
+        # Use the helper method for safe config access
+        if self.get_config_attr('eval_nuscenes'):
             os.makedirs("submission", exist_ok=True)
             json.dump(
                 self.pred_dicts,
@@ -199,7 +224,8 @@ class BaseModel(pl.LightningModule):
             if hasattr(self, "logger") and self.logger is not None:
                 self._log_metrics_to_wandb("val/nuscenes", metric_results)
 
-        elif self.config.eval_argoverse2:
+        # Use the helper method for safe config access
+        if self.get_config_attr('eval_argoverse2'):
             metric_results = self.compute_metrics_av2(self.pred_dicts)
 
             # Log metrics to wandb (already being logged in compute_metrics_av2)
@@ -247,21 +273,21 @@ class BaseModel(pl.LightningModule):
             and current_minADE < self._best_metrics["val/minADE6"]
         ):
             self._best_metrics["val/minADE6"] = current_minADE
-            self.log("val/best_minADE6", current_minADE, prog_bar=False, logger=True)
+            self.log("val/best_minADE6", current_minADE, prog_bar=False, logger=True, sync_dist=True)
 
         if (
             current_minFDE is not None
             and current_minFDE < self._best_metrics["val/minFDE6"]
         ):
             self._best_metrics["val/minFDE6"] = current_minFDE
-            self.log("val/best_minFDE6", current_minFDE, prog_bar=False, logger=True)
+            self.log("val/best_minFDE6", current_minFDE, prog_bar=False, logger=True, sync_dist=True)
 
         if (
             current_brier is not None
             and current_brier < self._best_metrics["val/brier_fde"]
         ):
             self._best_metrics["val/brier_fde"] = current_brier
-            self.log("val/best_brier_fde", current_brier, prog_bar=False, logger=True)
+            self.log("val/best_brier_fde", current_brier, prog_bar=False, logger=True, sync_dist=True)
 
     def configure_optimizers(self):
         raise NotImplementedError
@@ -351,8 +377,25 @@ class BaseModel(pl.LightningModule):
         return metric_results
 
     def compute_official_evaluation(self, batch_dict: BatchDict, prediction):
-        if self.config.eval_waymo:
-
+        """
+        Compute official evaluation metrics for the current batch.
+        
+        This method supports different evaluation modes based on the dataset:
+        - Waymo
+        - NuScenes
+        - Argoverse2
+        
+        Args:
+            batch_dict: Input batch containing trajectory data
+            prediction: Dictionary containing model predictions
+        """
+        # Check which evaluation mode to use
+        eval_waymo = self.get_config_attr('eval_waymo')
+        eval_nuscenes = self.get_config_attr('eval_nuscenes')
+        eval_argoverse2 = self.get_config_attr('eval_argoverse2')
+        
+        # Waymo evaluation
+        if eval_waymo:
             input_dict = batch_dict["input_dict"]
             pred_scores = prediction["predicted_probability"]
             pred_trajs = prediction["predicted_trajectory"]
@@ -391,10 +434,10 @@ class BaseModel(pl.LightningModule):
                 pred_dict_list.append(single_pred_dict)
 
             assert len(pred_dict_list) == batch_dict["batch_size"]
-
             self.pred_dicts += pred_dict_list
-
-        elif self.config.eval_nuscenes:
+            
+        # NuScenes evaluation
+        elif eval_nuscenes:
             from nuscenes.eval.prediction.data_classes import Prediction
 
             input_dict = batch_dict["input_dict"]
@@ -437,8 +480,9 @@ class BaseModel(pl.LightningModule):
                 )
 
             self.pred_dicts += pred_dict_list
-
-        elif self.config.eval_argoverse2:
+        
+        # Use the helper method for safe config access
+        elif self.get_config_attr('eval_argoverse2'):
 
             input_dict = batch_dict["input_dict"]
             pred_scores = prediction["predicted_probability"]
@@ -560,7 +604,8 @@ class BaseModel(pl.LightningModule):
         # merge new_dict with log_dict
         loss_dict.update(new_dict)
 
-        if status == "val" and self.config.eval:
+        # Use the helper method for safe config access
+        if status == "val" and self.get_config_attr('eval'):
 
             # Split scores based on trajectory type
             new_dict = {}
@@ -652,7 +697,7 @@ class BaseModel(pl.LightningModule):
             and hasattr(self, "logger")
             and isinstance(self.logger, WandbLogger)
             and self.logger.experiment is not None
-            and self.config.visualize_eval_predictions
+            and self.get_config_attr('visualize_eval_predictions')
         ):
             try:
                 # Sample a few trajectories to visualize
@@ -688,7 +733,7 @@ class BaseModel(pl.LightningModule):
             and hasattr(self, "logger")
             and isinstance(self.logger, WandbLogger)
         ):
-            if not self.config.visualize_eval_predictions:
+            if not self.get_config_attr('visualize_eval_predictions'):
                 return
             try:
                 # Generate the prediction for this batch
