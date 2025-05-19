@@ -38,7 +38,7 @@ class KNNBatch(Function):
         assert batch_idxs.is_contiguous() and batch_idxs.is_cuda
         assert query_batch_offsets.is_contiguous() and query_batch_offsets.is_cuda
 
-        idx = torch.cuda.IntTensor(n, k).zero_()
+        idx = torch.zeros((n, k), dtype=torch.int32, device='cuda')
 
         knn_cuda.knn_batch(xyz, query_xyz, batch_idxs, query_batch_offsets, idx, n, m, k)
 
@@ -73,7 +73,7 @@ class KNNBatchMlogK(Function):
         assert batch_idxs.is_contiguous() and batch_idxs.is_cuda
         assert query_batch_offsets.is_contiguous() and query_batch_offsets.is_cuda
         assert k <= 128
-        idx = torch.cuda.IntTensor(n, k).zero_()
+        idx = torch.zeros((n, k), dtype=torch.int32, device='cuda')
 
         knn_cuda.knn_batch_mlogk(xyz, query_xyz, batch_idxs, query_batch_offsets, idx, n, m, k)
 

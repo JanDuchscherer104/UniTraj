@@ -102,7 +102,7 @@ class LitTrainerFactoryConfig(BaseConfig["LitTrainerFactory"]):
     accumulate_grad_batches: int = 1
     """Accumulate gradients across batches."""
 
-    log_every_n_steps: int = 50
+    log_every_n_steps: int = 5
     """Log metrics every N steps."""
 
     check_val_every_n_epoch: int = 1
