@@ -19,7 +19,7 @@ def main():
         )
     
     # Limit samples for faster training (if needed)
-    cfg.datamodule.dataset_config.max_num_samples = 1024
+    # cfg.datamodule.dataset_config.max_num_samples = 1024
     
     # Force the max_epochs to be consistent
     cfg.trainer.max_epochs = cfg.model.max_epochs = 50
@@ -28,8 +28,7 @@ def main():
     cfg.trainer.devices = [1, 0]
 
     # Adjust batch size based on your GPU memory
-    cfg.model.train_batch_size = 64
-    cfg.model.eval_batch_size = 64
+    cfg.datamodule.batch_size = 64
     
     # Print configuration summary
     console("MTR Training Configuration:")
