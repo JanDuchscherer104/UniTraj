@@ -56,6 +56,8 @@ class DataParserConfig(BaseConfig["DataParser"]):
     # Data selection
     num_debug_samples: Optional[int] = Field(None)
     """Maximum number of scenarios to parse in debug mode per split."""
+    take_debug_samples_front: bool = Field(False)
+    """If True, take the first num_debug_samples samples from the dataset, else sample randomly."""
 
     starting_frame: List[int] = Field(
         [0],

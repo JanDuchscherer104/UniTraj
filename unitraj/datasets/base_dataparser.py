@@ -8,13 +8,14 @@ import h5py
 import numpy as np
 import pandas as pd
 from metadrive.scenario import utils as sd_utils
-from networkx import dfs_edges
 from typing_extensions import Self
 
 from ..configs.path_config import PathConfig
 from ..utils.console import Console
 from .common_utils import is_ddp
 from .types import (
+    AGENT_TYPE_MAP,
+    TRAJECTORY_TYPE_MAP,
     DatasetItem,
     InternalFormatDict,
     ProcessedDataDict,
@@ -170,8 +171,9 @@ class BaseDataParser(ABC):
 
             # write pandas DataFrame per split
             for split, info in sample_metadata.items():
-                df = pd.DataFrame.from_dict(info, orient="index")
-                df.to_pickle(self.paths.get_sample_metadata_path(split))
+                pd.DataFrame.from_dict(info, orient="index").pipe(
+                    self._format_sample_metadata
+                ).to_pickle(self.paths.get_sample_metadata_path(split))
 
     def process_data_chunk(
         self,
@@ -289,16 +291,48 @@ class BaseDataParser(ABC):
         )
         idx_path = self.paths.get_sample_metadata_path(split)
         try:
-            df = pd.read_pickle(idx_path)
+            df = pd.read_pickle(idx_path)  # type: pd.DataFrame
             if self.config.num_debug_samples is not None:
                 CONSOLE.log(
-                    f"Limiting to {self.config.num_debug_samples} / {len(df)} samples in {split.name}."
+                    f"Limiting to {self.config.num_debug_samples} / {len(df)} samples {'from the front' if self.config.take_debug_samples_front else 'randomly'} in {split.name}."
                 )
-                df = df.sample(n=min(self.config.num_debug_samples, len(df)))
+                df = (
+                    df.head(self.config.num_debug_samples)
+                    if self.config.take_debug_samples_front
+                    else df.sample(n=min(self.config.num_debug_samples, len(df)))
+                )
             return df
         except Exception as e:
             CONSOLE.error(f"Failed to load sample metadata DataFrame: {idx_path}: {e}")
             return pd.DataFrame()
+
+    def _format_sample_metadata(self, sample_metadata: pd.DataFrame) -> pd.DataFrame:
+        return (
+            sample_metadata.assign(
+                trajectory_type=sample_metadata["trajectory_type"].map(
+                    TRAJECTORY_TYPE_MAP
+                ),
+                center_objects_type=sample_metadata["center_objects_type"].map(
+                    AGENT_TYPE_MAP
+                ),
+            )
+            .astype(
+                {
+                    col: "category"
+                    for col in [
+                        "trajectory_type",
+                        "center_objects_type",
+                        "dataset_name",
+                    ]
+                }
+            )
+            .assign(
+                scenario_id=sample_metadata["scenario_id"].map(
+                    lambda x: str(x).replace(".pkl", "")
+                )
+            )
+            .assign()
+        )
 
     @abstractmethod
     def preprocess(self, scenario: RawScenarioDict) -> Optional[ProcessedDataDict]:
