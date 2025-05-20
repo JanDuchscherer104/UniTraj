@@ -62,17 +62,21 @@ class MTRConfig(ExperimentConfig):
             # Training settings
             max_epochs=50,
             # increased learning
-            learning_rate=0.0002,
-            learning_rate_sched=[22, 24, 26, 28],
+            learning_rate=0.0002, # 0.00015
+            learning_rate_sched=[22, 24, 26, 28], # [15, 30, 40, 45]
             optimizer="AdamW",
             scheduler="lambdaLR",
             grad_clip_norm=1000.0,
-            weight_decay=0.01,
-            lr_decay=0.5,
+            # Slightly increase from 0.01 to reduce overfitting
+            weight_decay=0.01, # 0.015
+            # Add to model config
+            # lr_warmup_epochs=3,
+            # More gradual decay (from 0.5)
+            lr_decay=0.5, # 0.6
             lr_clip=0.000001,
-            # increased batch size from 32 to 64
-            train_batch_size=64,
-            eval_batch_size=64,
+            # increased batch size from 32
+            train_batch_size=64, # 72
+            eval_batch_size=64, # 72
             # Data settings
             max_num_agents=64,
             map_range=100,
@@ -109,12 +113,26 @@ class MTRConfig(ExperimentConfig):
             max_epochs=50, 
             accelerator="gpu",
             # use both gpu's
-            devices=[0, 1],
+            devices=[1, 0],
             # Distributed Data Parallel
             strategy="ddp",
             # mixed precision for faster training
             precision="16-mixed",
             log_every_n_steps=10,
+            # Add early stopping
+            early_stopping=dict(
+                monitor="val_loss",
+                patience=5,
+                mode="min",
+                verbose=True
+            ),
+            # Add model checkpoint saving
+            model_checkpoint=dict(
+                monitor="val_loss",
+                save_top_k=3,
+                mode="min",
+                save_last=True
+            ),
         )
     )
 

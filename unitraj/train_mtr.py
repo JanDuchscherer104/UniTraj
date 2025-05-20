@@ -21,8 +21,15 @@ def main():
     # Limit samples for faster training (if needed)
     cfg.datamodule.dataset_config.max_num_samples = 1024
     
-    # Adjust based on your GPU memory
-    cfg.model.train_batch_size = 32
+    # Force the max_epochs to be consistent
+    cfg.trainer.max_epochs = cfg.model.max_epochs = 50
+    
+    # Set GPUs explicitly
+    cfg.trainer.devices = [1, 0]
+
+    # Adjust batch size based on your GPU memory
+    cfg.model.train_batch_size = 64
+    cfg.model.eval_batch_size = 64
     
     # Print configuration summary
     console("MTR Training Configuration:")
@@ -39,6 +46,21 @@ def main():
     cfg.setup_target_and_run("train")
     
     console("Training completed!")
+
+    cfg.ckpt_path = "default_exp/last.ckpt"
+
+    # Print configuration summary
+    console("Evaluation Configuration:")
+    console(f"Model: {cfg.model.model_name}")
+    console(f"Checkpoint: {cfg.ckpt_path}")
+    console(f"Evaluation batch size: {cfg.model.eval_batch_size}")
+    
+    # Evaluate the model
+    console("Starting evaluation...")
+    # This will set up the trainer, model, and datamodule, and run evaluation
+    cfg.setup_target_and_run("val")
+    
+    console("Evaluation completed!")
 
 if __name__ == "__main__":
     main()
