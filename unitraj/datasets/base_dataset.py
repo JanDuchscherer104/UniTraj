@@ -31,7 +31,7 @@ class DatasetConfig(BaseConfig["BaseDataset"]):
     is_debug: bool = Field(
         False, description="Debug mode (no MP, limited samples, CPU only)"
     )
-    max_num_samples: Optional[int] = 1024
+    max_num_samples: Optional[int] = None
 
     # Paths - Ensure PathConfig is used
     paths: PathConfig = Field(default_factory=PathConfig)
