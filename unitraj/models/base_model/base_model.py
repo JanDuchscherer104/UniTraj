@@ -682,7 +682,7 @@ class BaseModel(pl.LightningModule):
             self.log(
                 metric_name,
                 float(v),  # Ensure the value is a Python float
-                on_step=False,
+                on_step=status == "train",
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=size_dict[k],
