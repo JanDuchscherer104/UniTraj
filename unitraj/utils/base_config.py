@@ -9,12 +9,12 @@ from typing import (
     ForwardRef,
     Generic,
     Optional,
+    Set,
     Type,
     TypeVar,
 )
 
-from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 from rich.text import Text
 from rich.tree import Tree
 
@@ -32,7 +32,13 @@ class NoTarget:
 class BaseConfig(BaseModel, Generic[TargetType]):
     target: Callable[["BaseConfig[TargetType]"], TargetType] = Field(
         default_factory=lambda: NoTarget,
-        exclude=True,
+        exclude=True,  # This should ideally be sufficient
+        # Provide a placeholder schema in case exclude is not fully respected
+        # by the schema generation path used by pydantic-cli.
+        json_schema_extra={
+            "type": "string",
+            "description": "Internal callable target, not configurable via CLI/JSON",
+        },
     )
 
     model_config = ConfigDict(
@@ -48,55 +54,6 @@ class BaseConfig(BaseModel, Generic[TargetType]):
         description="Tracks fields propagated from parent configs",
     )
 
-    @classmethod
-    def from_hydra(cls, cfg: DictConfig) -> "BaseConfig":
-        """
-        Convert a raw Hydra DictConfig into our strongly-typed Pydantic AppConfig.
-        """
-        # turn into plain python dict, resolving interpolations
-        data = OmegaConf.to_container(cfg, resolve=True)
-        # feed into Pydantic constructor (will validate/convert types)
-        return cls.model_validate(data, strict=False)  # type: ignore
-
-    @classmethod
-    def from_toml(cls, toml_path: Path) -> "BaseConfig":
-        """
-        Load a configuration from a TOML file into this BaseConfig.
-        """
-        try:
-            import tomllib  # type: ignore[import]
-        except ImportError:
-            import tomli as tomllib
-        with toml_path.open("rb") as f:
-            data = tomllib.load(f)
-        # validate and convert nested configs
-        return cls.model_validate(data, strict=False)
-
-    def to_toml(self, toml_path: Path, exclude_none: bool = True) -> None:
-        """
-        Dump this config to a TOML file, serializing only Pydantic fields.
-        """
-        try:
-            import toml
-        except ImportError:
-            raise RuntimeError("Install 'toml' package to use BaseConfig.to_toml()")
-        data = self.model_dump(exclude_none=exclude_none)
-        toml_str = toml.dumps(data)
-        path = Path(toml_path)
-        path.write_text(toml_str, encoding="utf-8")
-
-    def dump_toml(self, toml_path: Path):
-        try:
-            import tomllib  # type: ignore[import]
-        except ImportError:
-            import tomli_w as tomllib
-        try:
-            with toml_path.open("wb") as f:
-                tomllib.dump(self.model_dump(), f)
-        except Exception as e:
-            Console().error(f"Failed to write TOML file {toml_path}: {e}")
-            raise e
-
     def setup_target(self, **kwargs: Any) -> TargetType:
         if not callable(factory := getattr(self.target, "setup_target", self.target)):
             Console().print(
@@ -109,17 +66,21 @@ class BaseConfig(BaseModel, Generic[TargetType]):
         return factory(self, **kwargs)
 
     def inspect(self, show_docs: bool = False) -> None:
-        """Pretty print config structure using rich.
-
-        Args:
-            indent: Base indentation level
-            show_docs: Whether to show field descriptions and docstrings
-        """
-        tree = self._build_tree(show_docs=show_docs)
+        tree = self._build_tree(show_docs=show_docs, _seen_singletons=set())
         Console().print(tree, soft_wrap=False, highlight=True, markup=True, emoji=False)
 
-    def _build_tree(self, show_docs: bool = False) -> Tree:
-        """Build rich Tree representation of config."""
+    def _build_tree(
+        self,
+        show_docs: bool = False,
+        _seen_singletons: Optional[Set[int]] = None,
+        _is_top_level: bool = True,
+        _seen_path_configs: Optional[Set[int]] = None,
+    ) -> Tree:
+        if _seen_singletons is None:
+            _seen_singletons = set()
+        if _seen_path_configs is None:
+            _seen_path_configs = set()
+
         tree = Tree(Text(self.__class__.__name__, style="config.name"))
 
         if show_docs and self.__class__.__doc__:
@@ -133,14 +94,69 @@ class BaseConfig(BaseModel, Generic[TargetType]):
                 else "config.field"
             )
 
+            # Handle singleton configs (only once)
+            if isinstance(value, SingletonConfig):
+                # Check if it's a PathConfig
+                is_path_config = value.__class__.__name__ == "PathConfig"
+
+                # If it's a PathConfig and we're not at the top level, just show a reference
+                if is_path_config and not _is_top_level:
+                    tree.add(
+                        Text(
+                            f"{field_name}: {value.__class__.__name__}(Singleton)",
+                            style="config.value",
+                        )
+                    )
+                    continue
+
+                # Regular singleton handling
+                if id(value) in _seen_singletons:
+                    tree.add(
+                        Text(
+                            f"{field_name}: {value.__class__.__name__}(Singleton)",
+                            style="config.value",
+                        )
+                    )
+                    continue
+
+                _seen_singletons.add(id(value))
+                subtree = tree.add(Text(f"{field_name}:", style=field_style))
+                subtree.add(
+                    value._build_tree(
+                        show_docs=show_docs,
+                        _seen_singletons=_seen_singletons,
+                        _is_top_level=False,
+                        _seen_path_configs=_seen_path_configs,
+                    )
+                )
+                continue
+
             # Create field node text
             field_text = Text()
             field_text.append(f"{field_name}: ", style=field_style)
 
             # Handle nested configs
             if isinstance(value, BaseConfig):
+                # Special handling for PathConfig
+                is_path_config = value.__class__.__name__ == "PathConfig"
+
+                # If it's a PathConfig and we're not at the top level, just show a reference
+                if is_path_config and not _is_top_level:
+                    tree.add(
+                        Text(
+                            f"{field_name}: {value.__class__.__name__}(Singleton)",
+                            style="config.value",
+                        )
+                    )
+                    continue
+
                 subtree = tree.add(field_text)
-                nested_tree = value._build_tree(show_docs=show_docs)
+                nested_tree = value._build_tree(
+                    show_docs=show_docs,
+                    _seen_singletons=_seen_singletons,
+                    _is_top_level=False,
+                    _seen_path_configs=_seen_path_configs,
+                )
                 subtree.add(nested_tree)
                 continue
 
@@ -152,7 +168,60 @@ class BaseConfig(BaseModel, Generic[TargetType]):
             ):
                 subtree = tree.add(field_text)
                 for i, item in enumerate(value):
-                    item_tree = item._build_tree(show_docs=show_docs)
+                    # SingletonConfig handling in lists
+                    if isinstance(item, SingletonConfig):
+                        # Check if it's a PathConfig
+                        is_path_config = item.__class__.__name__ == "PathConfig"
+
+                        # If it's a PathConfig and we're not at the top level, just show a reference
+                        if is_path_config and not _is_top_level:
+                            subtree.add(
+                                Text(
+                                    f"[{i}]: {item.__class__.__name__}(Singleton)",
+                                    style="config.value",
+                                )
+                            )
+                            continue
+
+                        if id(item) in _seen_singletons:
+                            subtree.add(
+                                Text(
+                                    f"[{i}]: {item.__class__.__name__}(Singleton)",
+                                    style="config.value",
+                                )
+                            )
+                            continue
+                        _seen_singletons.add(id(item))
+                        item_subtree = subtree.add(
+                            Text(f"[{i}]:", style="config.field")
+                        )
+                        item_subtree.add(
+                            item._build_tree(
+                                show_docs=show_docs,
+                                _seen_singletons=_seen_singletons,
+                                _is_top_level=False,
+                                _seen_path_configs=_seen_path_configs,
+                            )
+                        )
+                        continue
+
+                    # Check if regular item is a PathConfig
+                    is_path_config = item.__class__.__name__ == "PathConfig"
+                    if is_path_config and not _is_top_level:
+                        subtree.add(
+                            Text(
+                                f"[{i}]: {item.__class__.__name__}(Reference)",
+                                style="config.value",
+                            )
+                        )
+                        continue
+
+                    item_tree = item._build_tree(
+                        show_docs=show_docs,
+                        _seen_singletons=_seen_singletons,
+                        _is_top_level=False,
+                        _seen_path_configs=_seen_path_configs,
+                    )
                     subtree.add(Text(f"[{i}]", style="config.field")).add(item_tree)
                 continue
 
@@ -237,7 +306,7 @@ class BaseConfig(BaseModel, Generic[TargetType]):
         shared_fields = {
             name: value
             for name, value in self
-            if name in child_config.model_fields
+            if name in child_config.__class__.model_fields
             and name != parent_field
             and name not in ("propagated_fields", "target")
         }

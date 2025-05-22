@@ -1,14 +1,13 @@
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, Literal, Optional, Tuple, Union
 
 import pytorch_lightning as pl
-import torch
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from typing_extensions import Self
 
 from ..datasets.types import Stage
 from ..lightning.lit_datamodule import LitDatamodule, LitDatamoduleConfig
-from ..lightning.lit_trainer_factory import LitTrainerFactory, LitTrainerFactoryConfig
+from ..lightning.lit_trainer_factory import LitTrainerFactoryConfig
 from ..models import AutoBotConfig
 from ..models.base_model.base_model import BaseModel
 from ..utils.base_config import BaseConfig
@@ -18,7 +17,6 @@ from .path_config import PathConfig
 
 
 class ExperimentConfig(BaseConfig):
-    # experiment settings
     seed: Optional[int] = 42
     """Random seed for reproducibility"""
 
@@ -52,6 +50,12 @@ class ExperimentConfig(BaseConfig):
     ckpt_path: Optional[Annotated[Path, str]] = Field(None)
     """Path to a checkpoint to load. Relative to paths.checkpoints."""
 
+    stage: Literal["train", "val", "test"] = Field(
+        default="train",
+        cli=("-s", "--stage"),
+        description="Stage to run: train, val or test",
+    )
+
     @field_validator(
         "ckpt_path",
         mode="before",
@@ -84,10 +88,10 @@ class ExperimentConfig(BaseConfig):
         is_debug = data.get("is_debug", False)  # Default to False if not present
 
         # Ensure 'method' is a dict and set 'is_debug' if not already present
-        method_cfg = data.get("method", {})
+        method_cfg = data.get("model", {})
         if isinstance(method_cfg, dict):
             method_cfg.setdefault("is_debug", is_debug)
-            data["method"] = method_cfg
+            data["model"] = method_cfg
         elif isinstance(method_cfg, BaseModel) and hasattr(
             method_cfg, "is_debug"
         ):  # If already an instance
@@ -127,7 +131,7 @@ class ExperimentConfig(BaseConfig):
         """
         if self.paths:  # Ensure self.paths itself is initialized
             sub_configs_to_update = []
-            if hasattr(self, "method") and self.model is not None:
+            if hasattr(self, "model") and self.model is not None:
                 sub_configs_to_update.append(self.model)
             if hasattr(self, "datamodule") and self.datamodule is not None:
                 sub_configs_to_update.append(self.datamodule)
@@ -211,45 +215,8 @@ class ExperimentConfig(BaseConfig):
             CONSOLE.error(f"Unsupported stage: {stage}")
             raise ValueError(f"Unsupported stage: {stage}")
 
-        # # Determine checkpoint path
-        # ckpt_path_to_load = self.ckpt_path
-        # if ckpt_path_to_load is None:
-        #     CONSOLE.log("Searching for the latest checkpoint...")
-        #     ckpt_path_to_load = trainer_factory.find_latest_checkpoint()
-        #     if ckpt_path_to_load:
-        #         CONSOLE.log(f"Found checkpoint to resume/load: {ckpt_path_to_load}")
-        #     else:
-        #         CONSOLE.log("No checkpoint found, starting training from scratch.")
-
-        # # Run the specified stage
-        # if stage == Stage.TRAIN:
-        #     CONSOLE.log("Starting training (fit)...")
-        #     trainer.fit(
-        #         model=model,
-        #         datamodule=datamodule,
-        #         ckpt_path=ckpt_path_to_load,
-        #     )
-        # elif stage == Stage.TEST:
-        #     CONSOLE.log("Starting testing...")
-        #     if ckpt_path_to_load is None:
-        #         CONSOLE.warn(
-        #             "Testing requires a checkpoint. Please provide ckpt_path or ensure a checkpoint exists."
-        #         )
-        #     trainer.test(
-        #         model=model, datamodule=datamodule, ckpt_path=ckpt_path_to_load
-        #     )
-        # elif stage == Stage.VAL:
-        #     CONSOLE.log("Starting validation...")
-        #     if ckpt_path_to_load is None:
-        #         CONSOLE.warn(
-        #             "Validation requires a checkpoint. Please provide ckpt_path or ensure a checkpoint exists."
-        #         )
-        #     trainer.validate(
-        #         model=model, datamodule=datamodule, ckpt_path=ckpt_path_to_load
-        #     )
-        # else:
-        #     CONSOLE.error(f"Unsupported stage: {stage}")
-        #     raise ValueError(f"Unsupported stage: {stage}")
-
-        # CONSOLE.log(f"Stage '{stage}' finished.")
-        # return trainer
+    def run(self) -> None:
+        """
+        pydantic-settings-cli entrypoint: run the configured experiment.
+        """
+        self.setup_target_and_run(self.stage)

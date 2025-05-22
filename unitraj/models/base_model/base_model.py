@@ -7,9 +7,10 @@ import pytorch_lightning as pl
 import torch
 import unitraj.datasets.common_utils as common_utils
 import unitraj.utils.visualization as visualization
-import wandb
 from pydantic import Field
 from pytorch_lightning.loggers import WandbLogger
+
+import wandb
 
 from ...datasets.types import BatchDict
 from ...utils.base_config import BaseConfig
@@ -18,10 +19,6 @@ from ...utils.base_config import BaseConfig
 class BaseModelConfig(BaseConfig):
     """Base configuration for trajectory prediction models."""
 
-    # Training parameters
-    # max_epochs: int = Field(
-    #     default=100, description="Maximum number of training epochs"
-    # )
     learning_rate: float = Field(default=0.00075, description="Initial learning rate")
     learning_rate_sched: List[int] = Field(
         default=[10, 20, 30, 40, 50],
@@ -637,7 +634,7 @@ class BaseModel(pl.LightningModule):
             self.log(
                 metric_name,
                 float(v),  # Ensure the value is a Python float
-                on_step=False,
+                on_step=status == "train",
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=size_dict[k],

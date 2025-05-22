@@ -120,9 +120,7 @@ class DataParserConfig(BaseConfig["DataParser"]):
     """If True, only predict agents as specified in the dataset. If False, predict agents based on trajectory_filter."""
 
     # Map processing configuration
-    center_offset_of_map: List[float] = Field(
-        [30.0, 0.0], description="Center offset of the map"
-    )
+    center_offset_of_map: List[float] = Field([30.0, 0.0])
     """XY offset from the AV used to center map crops. Applied before range filtering."""
 
     crop_agents: bool = Field(False)
@@ -154,12 +152,12 @@ class DataParserConfig(BaseConfig["DataParser"]):
     num_points_each_polyline: int = Field(20)
     """Target number of points in each polyline segment after resampling."""
 
-    paths: PathConfig = Field(default_factory=PathConfig)
+    paths: PathConfig = Field(default_factory=PathConfig, exclude=True)
     """
     Stores all filesystem paths required for loading/writing datasets and cache.
     """
 
-    target: Type["DataParser"] = Field(default_factory=lambda: DataParser)
+    target: Type["DataParser"] = Field(default_factory=lambda: DataParser, exclude=True)
 
     def get_num_workers(self) -> int:
         total = cpu_count()

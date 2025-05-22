@@ -24,9 +24,11 @@ class LitDatamoduleConfig(BaseConfig["LitDatamodule"]):
     Implements the Config-as-Factory pattern.
     """
 
-    target: Type["LitDatamodule"] = Field(default_factory=lambda: LitDatamodule)
+    target: Type["LitDatamodule"] = Field(
+        default_factory=lambda: LitDatamodule, exclude=True
+    )
 
-    dataset_config: DatasetConfig = Field(default_factory=DatasetConfig)
+    dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     """Configuration for the dataset to be used."""
 
     batch_size: int = Field(32)
@@ -98,7 +100,7 @@ class LitDatamodule(pl.LightningDataModule):
         assert isinstance(stage, (str, Stage)), "Stage must be a string or Stage enum"
         stage = stage if isinstance(stage, Stage) else Stage.from_str(stage)
 
-        dataset_config = self.config.dataset_config.model_copy()
+        dataset_config = self.config.dataset.model_copy()
         dataset_config.stage = stage
 
         if stage == Stage.TRAIN:

@@ -21,7 +21,9 @@ from .types import DatasetItem, Stage
 class DatasetConfig(BaseConfig["BaseDataset"]):
     """Configuration for the BaseDataset."""
 
-    target: Type["BaseDataset"] = Field(default_factory=lambda: BaseDataset)
+    target: Type["BaseDataset"] = Field(
+        default_factory=lambda: BaseDataset, exclude=True
+    )
 
     stage: Stage = Field(Stage.TRAIN)
     """
@@ -33,7 +35,7 @@ class DatasetConfig(BaseConfig["BaseDataset"]):
     )
 
     # Paths - Ensure PathConfig is used
-    paths: PathConfig = Field(default_factory=PathConfig)
+    paths: PathConfig = Field(default_factory=PathConfig, exclude=True)
     parser: DataParserConfig = Field(default_factory=DataParserConfig)
     """
     Attributes (all of type Path):

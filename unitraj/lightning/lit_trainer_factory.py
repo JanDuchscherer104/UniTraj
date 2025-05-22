@@ -5,8 +5,12 @@ from typing import List, Literal, Optional, Type, Union
 import pytorch_lightning as pl
 import torch
 from pydantic import Field, field_validator, model_validator
-from pytorch_lightning.callbacks import (Callback, EarlyStopping,
-                                         LearningRateMonitor, ModelCheckpoint)
+from pytorch_lightning.callbacks import (
+    Callback,
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 from pytorch_lightning.loggers import Logger
 from typing_extensions import Self
 
@@ -71,7 +75,9 @@ class LitTrainerFactoryConfig(BaseConfig["LitTrainerFactory"]):
     Acts as a factory for the Trainer. Inherits from BaseConfig.
     """
 
-    target: Type["LitTrainerFactory"] = Field(default_factory=lambda: LitTrainerFactory)
+    target: Type["LitTrainerFactory"] = Field(
+        default_factory=lambda: LitTrainerFactory, exclude=True
+    )
     # Trainer settings
     accelerator: str = "auto"
     """Accelerator to use ('cpu', 'gpu', 'tpu', 'mps', 'auto')."""
@@ -121,7 +127,7 @@ class LitTrainerFactoryConfig(BaseConfig["LitTrainerFactory"]):
     """Configuration for callbacks."""
 
     # Use the imported PathConfig, which is a SingletonConfig
-    path_config: PathConfig = Field(default_factory=PathConfig)
+    path_config: PathConfig = Field(default_factory=PathConfig, exclude=True)
     """Path configuration for checkpoints."""
 
     # Experiment info (will be propagated if defined in parent ExperimentConfig)
