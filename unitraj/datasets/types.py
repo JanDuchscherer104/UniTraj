@@ -515,6 +515,15 @@ class DatasetItem(BaseModel):
                 tdict[name] = val
         return tdict
 
+    def get_object_types(dataset_item):
+        """
+        Extract object types from the one-hot encoding in obj_trajs at the first timestep.
+        """
+        return [
+            AGENT_TYPE_MAP.get(idx, "unknown")
+            for idx in np.argmax(dataset_item.obj_trajs[:, 0, 6:11], axis=1)
+        ]
+
     def summary(self) -> str:
         sid = (
             self.scenario_id.decode("utf-8")
