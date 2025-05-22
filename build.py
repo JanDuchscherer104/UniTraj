@@ -1,8 +1,5 @@
 import os
-
-from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
 
 def make_cuda_ext(name, module, sources):
     cuda_ext = CUDAExtension(
@@ -11,21 +8,12 @@ def make_cuda_ext(name, module, sources):
     )
     return cuda_ext
 
-
-if __name__ == '__main__':
-    setup(
-        name='UniTraj',
-        version=1.0,
-        description='A Unified Framework for Scalable Vehicle Trajectory Prediction',
-        author='Lan Feng',
-        author_email='fenglan18@outlook.com',
-        license='Apache License 2.0',
-        packages=find_packages(exclude=['tools', 'data', 'output']),
-        cmdclass={
-            'build_ext': BuildExtension,
-        },
-
-        ext_modules=[
+def build(setup_kwargs):
+    """
+    This function is required by Poetry to build the package with CUDA extensions.
+    """
+    setup_kwargs.update({
+        'ext_modules': [
             make_cuda_ext(
                 name='knn_cuda',
                 module='unitraj.models.mtr.ops.knn',
@@ -49,4 +37,9 @@ if __name__ == '__main__':
                 ],
             ),
         ],
-    )
+        'cmdclass': {
+            'build_ext': BuildExtension
+        }
+    })
+
+    return setup_kwargs

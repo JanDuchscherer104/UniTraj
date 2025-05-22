@@ -1,0 +1,45 @@
+[tool.poetry]
+name = "UniTraj"
+version = "1.0.0"
+description = "A Unified Framework for Scalable Vehicle Trajectory Prediction"
+authors = ["Lan Feng <fenglan18@outlook.com>"]
+license = "Apache License 2.0"
+packages = [{include = "unitraj"}]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.12"
+torch = "^2.7.0"
+torchvision = "^0.22.0"
+torchaudio = "^2.7.0"
+wandb = "^0.19.11"
+pytorch-lightning = "^2.5.1.post0"
+scikit-learn = "^1.1.1"
+einops = "^0.8.1"
+easydict = "^1.13"
+panda3d-simplepbr = "0.13.1"
+h5py = "^3.7.0"
+pandas = "^2.2.2"
+matplotlib = "^3.10.3"
+seaborn = "^0.13.2"
+pydantic = "^2.7.1"
+pydantic-settings = "^2.9.1"
+rich = "^14.0.0"
+devtools = "^0.12.2"
+tomli-w = "^1.2.0"
+metadrive-simulator = "^0.4.3"
+av2="^0.3.5"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.5"
+jupyter = "^1.0.0"
+ipykernel = "^6.29.4"
+notebook = "^7.2.0"
+jupyterlab = "^4.2.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0", "setuptools>=42", "wheel", "torch>=2.7.0", "numpy>=1.21.0", "ninja"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.build]
+script = "build.py"
+generate-setup-file = true
