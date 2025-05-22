@@ -1,9 +1,10 @@
 from pathlib import Path
 from typing import Any, Literal, Optional, Type, Union
 
-import wandb
 from pydantic import Field
 from pytorch_lightning.loggers import WandbLogger
+
+import wandb
 
 from ..utils.base_config import BaseConfig
 from .path_config import PathConfig
