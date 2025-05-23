@@ -4,16 +4,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import h5py
-import hydra
 import numpy as np
-from metadrive.scenario.scenario_description import MetaDriveType
 from pydantic import BaseModel, Field, field_validator
 from torch.utils.data import Dataset
 
 from ..configs.path_config import PathConfig
 from ..utils.base_config import BaseConfig
 from ..utils.console import Console
-from ..utils.visualization import check_loaded_data
 from .dataparser import DataParserConfig
 from .types import DatasetItem, Stage
 
