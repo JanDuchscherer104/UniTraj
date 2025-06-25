@@ -16,7 +16,7 @@ if __name__ == "__main__":
         is_debug=False,
         
         # Specify checkpoint path for a trained model
-        ckpt_path="default_exp/last.ckpt",
+        ckpt_path="default_exp/last-v13.ckpt",
     )
 
     # Enable visualization
